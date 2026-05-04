@@ -18,7 +18,7 @@ vertex snapping (the wobble), affine texture warping (the swim), 320×240 intern
 framebuffer upscaled with nearest-neighbour, and a limited geometry budget (The OBJ loader is reflective of this philosophy).
 
 
-![Editor with cube selected](docs/screenshots/editor3.png)
+![Editor with cube selected](docs/screenshots/edior3.png)
 
 ## Aesthetic features
 
