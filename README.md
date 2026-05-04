@@ -18,6 +18,8 @@ vertex snapping (the wobble), affine texture warping (the swim), 320×240 intern
 framebuffer upscaled with nearest-neighbour, and a limited geometry budget (The OBJ loader is reflective of this philosophy).
 
 
+![Editor with cube selected](docs/screenshots/editor3.png)
+
 ## Aesthetic features
 
 - **Vertex snap** — screen-space coordinate quantisation in the vertex shader
@@ -25,6 +27,8 @@ framebuffer upscaled with nearest-neighbour, and a limited geometry budget (The 
 - **320×240 FBO** with `GL_NEAREST` upscale — pixelated, low-res rendering
 - **Texture × vertex colour** blend — authentic PSX tinting
 - Geometry budget validation — warns when meshes exceed PSX-era polygon counts
+
+![Editor with cube selected](docs/screenshots/editor4.png)
 
 ## Editor features
 
