@@ -1,0 +1,11 @@
+{
+  "name": "psx-engine",
+  "version": "0.1.0",
+  "dependencies": [
+    { "name": "sdl2", "default-features": false,
+      "features": ["wayland", "x11", "dbus"] },
+    "glm",
+    "nlohmann-json",
+    "entt"
+  ]
+}
