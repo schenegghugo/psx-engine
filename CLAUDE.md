@@ -38,7 +38,7 @@ Binaries must run from their own directory — shaders/ and assets/ are
 copied there at build time and loaded relative to cwd:
 ```bash
 cd build/linux/engine && ./psx_engine    # F1 = ImGui overlay
-cd build/linux/editor && ./psx_editor    # milestone 3+
+cd build/linux/editor && ./psx_editor    # full level editor
 ```
 
 ---
@@ -50,6 +50,7 @@ cd build/linux/editor && ./psx_editor    # milestone 3+
 | GL loader | GLAD glad1/0.1.x (vendored) | `vendor/glad/` — no GLX |
 | GL | OpenGL 3.3 core | Mesa 26.x / 4.6 on T480 |
 | UI | Dear ImGui docking (vendored) | `vendor/imgui/` |
+| Gizmo | ImGuizmo (vendored) | `vendor/imguizmo/` |
 | Math | GLM (vcpkg) | |
 | ECS | EnTT (vcpkg) | linked, not yet used |
 | JSON | nlohmann_json (vcpkg) | .pscene format |
@@ -64,67 +65,48 @@ works on EGL/Wayland, GLX/X11, and WGL/Windows. Never use GLEW.
 ## Repository layout
 ```
 shared/
-  scene_format.hpp        psx::Vertex, psx::SceneObject, psx::Scene
-                          Must stay free of platform headers (used by both targets)
+  scene_format.hpp        psx::Node, psx::Scene (tree-based, milestone 4+)
 
 engine/
   src/main.cpp            SDL2 + GLAD init, two-pass render loop, ImGui overlay
-  src/renderer/           planned
-  src/scene/              planned
-  src/ecs/                planned (EnTT linked, unused)
-  src/audio/              planned
   shaders/
-    psx.vert              PSX scene pass: MVP, vertex snap, affine UV warp
-    psx.frag              texture * vertex colour, u_use_texture toggle
-    blit.vert             fullscreen quad, no transform
-    blit.frag             GL_NEAREST sample of PSX FBO texture
+    psx.vert              MVP, vertex snap, affine UV warp
+    psx.frag              texture * vertex colour
+    blit.vert / blit.frag fullscreen quad upscale
 
 editor/
-  src/main.cpp            milestone 3 implementation goes here
-  src/ui/                 ImGui panels
-  src/viewport/           PSX renderer reused for preview
-  src/pipeline/           asset import
-  shaders/                copies of engine shaders (shared PSX preview)
+  src/main.cpp            full editor implementation
+  shaders/                copies of engine shaders
 
 vendor/
-  glad/
-    src/glad.c
-    include/glad/glad.h
-    include/KHR/khrplatform.h
-  imgui/
-    imgui*.h / imgui*.cpp
-    backends/imgui_impl_sdl2.{h,cpp}
-    backends/imgui_impl_opengl3.{h,cpp}
+  glad/                   OpenGL loader
+  imgui/                  Dear ImGui docking branch
+  imguizmo/               3D gizmo
 
 assets/
-  meshes/test.obj         cube with UVs (regenerated at startup if vt missing)
-  textures/test.tga       64×64 checkerboard (generated at startup if missing)
+  meshes/test.obj         unit cube with UVs
+  textures/test.tga       64x64 checkerboard
 
 cmake/
-  toolchain-mingw.cmake   MinGW-w64 x86_64 cross-compile
+  toolchain-mingw.cmake   Windows cross-compile
 ```
 
 ---
 
 ## Render pipeline (engine/src/main.cpp)
-Two passes every frame:
-
 **Pass 1 — PSX FBO**
-- Bind `PSXFramebuffer` (320×240, `GL_NEAREST`, `GL_DEPTH24_STENCIL8`)
-- `glEnable(GL_DEPTH_TEST)`
-- Draw scene meshes with `psx.vert` / `psx.frag`
+- Bind `PSXFramebuffer` (320x240, `GL_NEAREST`, `GL_DEPTH24_STENCIL8`)
+- `glEnable(GL_DEPTH_TEST)`, draw scene meshes
 - Uniforms: `u_mvp` (mat4), `u_snap_resolution` (float), `u_use_texture` (int), `u_texture` (sampler2D)
 
 **Pass 2 — blit**
-- Unbind FBO, fullscreen quad → window
-- `blit.vert` / `blit.frag`, `GL_NEAREST` upscale
+- Unbind FBO, fullscreen quad, `GL_NEAREST` upscale to window
 
-**ImGui**
-- `NewFrame` → panels → `Render` → `RenderDrawData` → `SDL_GL_SwapWindow`
+**ImGui** — `NewFrame` → panels → `Render` → `RenderDrawData` → `SDL_GL_SwapWindow`
 
 ---
 
-## Vertex layout (stride = 8 × float)
+## Vertex layout (stride = 8 x float)
 | attrib | location | components | offset |
 |---|---|---|---|
 | position | 0 | 3 floats | 0 |
@@ -136,107 +118,243 @@ Two passes every frame:
 ---
 
 ## PSX aesthetic rules
-- **Vertex snap** (`psx.vert`, `u_snap_resolution`):
-  `floor(ndc * half_res + 0.5) / half_res` — lower = more wobble, 0 = off
-- **320×240 FBO** + `GL_NEAREST` upscale — pixelated look
-- **Affine texture warp**: `v_uv = a_uv * clip.w` in `psx.vert` — skips
-  perspective correction, UVs interpolate linearly in screen space (swim effect)
-- **Depth buffer**: active (`GL_DEPTH24_STENCIL8`), painter's algo not yet implemented
-- **Texture blend**: `texture(u_texture, v_uv / v_uv_w) * vec4(v_colour, 1.0)`
+- **Vertex snap**: `floor(ndc * half_res + 0.5) / half_res` in `psx.vert`
+- **320x240 FBO** + `GL_NEAREST` upscale
+- **Affine texture warp**: `v_uv = a_uv * clip.w` — perspective-incorrect, the swim effect
+- **Depth buffer**: GL_DEPTH24_STENCIL8 active
+- **Texture blend**: `texture(u_tex, v_uv / v_uv_w) * vec4(v_colour, 1.0)`
 
 ---
 
-## Scene format (.pscene)
-nlohmann JSON. Schema lives in `shared/scene_format.hpp`:
+## Scene format (.pscene v2 — tree-based)
+
+The current flat `objects[]` schema is being upgraded to a node tree in
+milestone 4. The loader handles both v1 (objects array) and v2 (nodes
+array) — v1 files auto-migrate on load.
+
+### Schema v2
+
 ```json
 {
-  "name": "untitled",
-  "objects": [
+  "format_version": 2,
+  "name": "level1",
+  "nodes": [
     {
-      "name": "cube",
-      "mesh_path": "assets/meshes/test.obj",
-      "texture_path": "assets/textures/test.tga",
-      "position": [0, 0, 0],
-      "rotation": [0, 0, 0],
-      "scale": [1, 1, 1],
-      "collision": "box"
+      "id": 0,
+      "name": "Level",
+      "kind": "node",
+      "parent": -1,
+      "children": [1, 2],
+      "transform": {
+        "position": [0, 0, 0],
+        "rotation": [0, 0, 0],
+        "scale": [1, 1, 1]
+      },
+      "components": {}
+    },
+    {
+      "id": 1,
+      "name": "Floor",
+      "kind": "mesh",
+      "parent": 0,
+      "children": [],
+      "transform": {...},
+      "components": {
+        "mesh": { "path": "assets/meshes/floor.obj", "texture": "assets/textures/test.tga" },
+        "collision": { "type": "mesh" }
+      }
+    },
+    {
+      "id": 2,
+      "name": "Player",
+      "kind": "player",
+      "parent": 0,
+      "children": [3, 4],
+      "transform": {...},
+      "components": {
+        "spawn": { "is_default": true }
+      }
+    },
+    {
+      "id": 3,
+      "name": "Camera",
+      "kind": "camera",
+      "parent": 2,
+      "children": [],
+      "transform": {...},
+      "components": {
+        "camera": { "fov": 60, "near": 0.1, "far": 100 }
+      }
+    },
+    {
+      "id": 4,
+      "name": "Capsule",
+      "kind": "mesh",
+      "parent": 2,
+      "children": [],
+      "transform": {...},
+      "components": {
+        "mesh": { "path": "__primitive_cylinder__", "texture": "" },
+        "collision": { "type": "convex" }
+      }
     }
   ]
 }
 ```
-`collision` values: `none` | `box` | `mesh` | `convex` (box = AABB auto-fit)
+
+### Node kinds
+
+| kind | typical components | purpose |
+|---|---|---|
+| `node` | (any) | empty container, group / pivot |
+| `mesh` | `mesh`, optional `collision` | renders geometry |
+| `camera` | `camera` | viewpoint, can be active |
+| `light` | `light` | contributes to lighting pass (m7+) |
+| `player` | `spawn`, optional `controller` | player rig root |
+
+### Components (data-only attachments)
+
+| name | fields |
+|---|---|
+| `mesh` | `path` (OBJ or `__primitive_*__`), `texture` (TGA path or empty) |
+| `collision` | `type`: `none` / `box` / `mesh` / `convex` |
+| `camera` | `fov` (degrees), `near`, `far`, optional `is_active` (bool) |
+| `light` | `type` (directional/point), `color` [r,g,b], `intensity` |
+| `spawn` | `is_default` (bool) — default spawn point if multiple |
+| `controller` | `type` (fps / orbit / scripted), `speed`, `mouse_sensitivity` |
+
+### Transforms
+
+Every node stores a **local** transform (position, rotation Euler XYZ
+degrees, scale) relative to its parent. World transform = chain of parent
+transforms walked from root. Moving a Player node moves its Camera and
+Capsule children automatically.
+
+### Migration from v1
+
+Loader detects `objects[]` (v1) vs `nodes[]` (v2). v1 files become a
+single root `node` with one `mesh` child per old SceneObject, preserving
+all transforms and collision settings.
 
 ---
 
 ## Milestone status
 
-### ✅ Milestone 0 — triangle
-SDL2 window, GLAD (Wayland-safe), Dear ImGui overlay, PSX FBO pipeline,
-vertex snap shader, 320×240 nearest upscale.
+### Milestone 0 — triangle (DONE)
+SDL2 + GLAD + ImGui + PSX FBO pipeline.
 
-### ✅ Milestone 1 — OBJ + camera
-Manual OBJ loader (v/vt/f, fan triangulation). Free-look camera (WASD +
-mouse, SDL relative mode). MVP uniform. Assets copied by CMake post-build.
+### Milestone 1 — OBJ + camera (DONE)
+Manual OBJ loader, free-look camera (WASD + mouse), MVP uniform.
 
-### ✅ Milestone 2 — textures
-Manual TGA loader (type-2, 24-bit BGR). Programmatic 64×64 checkerboard
-generated at startup. Affine UV warp. Vertex layout updated to 8 floats.
-`u_use_texture` ImGui toggle.
+### Milestone 2 — textures (DONE)
+Manual TGA loader, programmatic checkerboard, affine UV warp.
 
-### 🔲 Milestone 3 — Level Editor MVP
-**Target: `psx_editor` becomes a usable level editor for non-coders.**
+### Milestone 3 — Level Editor MVP (DONE)
+Full editor: dockspace (Viewport/Outliner/Inspector), orbit camera with
+Blender keybinds, ImGuizmo translate/rotate/scale, primitives (cube/plane
+/sphere/cylinder/cone), file pickers, OBJ validation (PSX triangle/UV
+budget), undo/redo, save/load .pscene v1, menubar, duplicate, dirty title.
 
-Layout inspired by Blender (simplified):
-```
-┌─────────────────────────┬──────────────┐
-│                         │  Outliner    │
-│    3D Viewport          │  (hierarchy) │
-│    PSX renderer         ├──────────────┤
-│    preview              │  Inspector   │
-│                         │  (properties)│
-└─────────────────────────┴──────────────┘
-```
+---
 
-Panels:
-- **Viewport**: PSX renderer preview, middle-mouse orbit, scroll zoom,
-  G to grab/move selected object, gizmo on selected object
-- **Outliner**: flat list of scene objects, click to select,
-  eye icon to toggle visibility, + button to add object
-- **Inspector**: Object tab — name, mesh path (file picker), texture path
-  (file picker), transform (pos/rot/scale with drag fields),
-  collision type dropdown, instance_count for array mesh
+### Milestone 4 — Scene tree (Node + components)  [CURRENT]
 
-Interaction model (Blender-inspired, simplified):
-- Middle mouse = orbit camera
-- Scroll = zoom
-- G = grab (move) selected object on XZ plane
-- Escape = deselect / cancel operation
-- Del = delete selected object
-- Ctrl+S = save .pscene
-- Ctrl+O = open .pscene
+**Why:** Currently SceneObject is flat — Cube/Light/Spawn Point all render
+as a cube because there is no concept of node *kind*. Real engines split
+**what an object is** from **what mesh it draws**, and use a parent/child
+**tree** so parenting "just works" (move Player → Camera and Capsule follow).
 
-File I/O:
-- Save/load `.pscene` via nlohmann JSON
-- Asset paths stored relative to project root
+**Architectural decisions:**
+- **Composition over inheritance.** A `Node` is `{ id, name, kind, transform, parent, children, components{} }`. Specialisation is data, not subclasses. Same approach as Godot.
+- **Local transforms only stored.** World transform = walk up the parent chain. Recomputed each frame for animated nodes; cached for static.
+- **Components are JSON objects keyed by name.** Adding a new component type means: define its schema, add an Inspector panel for it, optionally wire it into the renderer/runtime.
+- **The editor already produces a flat list — we keep .pscene v1 readable indefinitely.** v1 files load as a flat tree (single root node + N mesh children).
 
-Implementation order (do one step at a time, build between each):
-1. Dockspace + empty panels (just labels)
-2. Viewport panel with PSX renderer + orbit camera
-3. Outliner panel with hardcoded test objects
-4. Inspector panel with transform fields
-5. Add/delete objects
-6. Save/load .pscene
-7. File pickers for mesh/texture
-8. Gizmo on selected object
+**Implementation order — one step per prompt, build between each:**
 
-### 🔲 Milestone 4 — Physics / Collision
-- `SceneObject` collision field: `none` | `box` | `mesh` | `convex`
-- Box: AABB auto-fit from mesh bounds (default)
-- Mesh: exact triangle collision (level geometry)
-- Convex: simplified hull (dynamic objects)
-- Editor: wireframe overlay — green=box, yellow=convex, red=mesh
-- Engine: AABB/ray tests at runtime, no physics lib required
-- Hull data embedded in `.pscene`
+#### Step 1 of 7 — `shared/scene_format.hpp` v2
+- Define `psx::Node`, `psx::Component` (variant of mesh/collision/camera/light/spawn/controller), `psx::Scene` with `nodes` vector
+- JSON serialise/deserialise via nlohmann_json
+- v1 → v2 migration helper: `Scene::from_v1(json)`
+- Loader detects schema by checking for `format_version` or `nodes` key
+- Both targets include from `shared/`
+
+#### Step 2 of 7 — Editor outliner becomes a tree
+- Replace flat list with `ImGui::TreeNodeEx` per node
+- Indentation by depth, expand/collapse triangles
+- Selection state moved to `selected_node_id` (instead of index)
+- Visibility toggle `[v]/[ ]` retained per node
+- "+" button still works — adds new node as child of selected (or root if nothing selected)
+
+#### Step 3 of 7 — Add by kind (Empty / Mesh / Camera / Light / Player)
+- "+" dropdown becomes a kind picker:
+  - `Empty Node` — kind=node, no components
+  - `Mesh > From File / Cube / Plane / Sphere / Cylinder / Cone` (current primitives, packaged as mesh nodes)
+  - `Camera`
+  - `Light > Directional / Point`
+  - `Player` (kind=player, child Camera auto-added, child Capsule auto-added)
+- New nodes get unique auto-incrementing IDs
+
+#### Step 4 of 7 — Per-kind Inspector
+- Inspector panel switches layout based on `selected.kind`:
+  - **All kinds**: name, transform (position/rotation/scale)
+  - **Mesh kind**: + mesh component (path picker, texture picker, collision dropdown, validation warnings)
+  - **Camera kind**: + camera component (FOV, near/far, "Set as active" button)
+  - **Light kind**: + light component (type, colour picker, intensity)
+  - **Player kind**: + spawn component (default toggle), + controller component (type dropdown, speed, sensitivity)
+- Each component section is collapsible (`ImGui::CollapsingHeader`)
+
+#### Step 5 of 7 — Re-parenting (drag in outliner)
+- Drag-source on each tree row, drop-target on each tree row
+- On drop: change `parent` field, update `children` lists on both old and new parents
+- Prevent cycles (cannot parent a node to its own descendant)
+- Drag onto empty area → re-parent to scene root
+- Recompute world transforms automatically (already done each frame, no extra work)
+
+#### Step 6 of 7 — Engine reads the tree
+- Replace flat `scene_objects` with `Scene` from `shared/scene_format.hpp`
+- Walk tree, compute world transforms
+- For each `mesh` node: render with mesh + texture from its component
+- Active camera selection:
+  - Find `camera` node with `is_active = true`, or
+  - Find `camera` child of any `player` node, or
+  - Fall back to free-look camera (current engine camera)
+- LightNodes contribute to a uniform array (basic; full lighting pass is m7)
+
+#### Step 7 of 7 — Camera preview in editor (nice-to-have)
+- Editor inspector for camera nodes shows a "Preview" mini-viewport
+- Renders the scene from that camera's perspective at 160x120
+- Refreshes only when camera transform or component changes (cheap)
+
+---
+
+### Milestone 5 — Engine catches up + scene path argument
+- Engine command-line: `./psx_engine my_level.pscene` (default `scene.pscene`)
+- Editor menubar: "Play" button → launches engine with current scene file
+- Move all loaders (`load_obj`, `load_tga`, `generate_primitive`) to `shared/`
+- Single source of truth across both targets
+
+### Milestone 6 — Physics / Collision
+- AABB / mesh / convex collision data already in `.pscene` (m3+)
+- Runtime collision detection: AABB vs AABB, ray vs triangle, sphere vs mesh
+- No physics lib — write what we need
+- Editor wireframes already visible (m3 step 8)
+
+### Milestone 7 — Lighting pass
+- Vertex-coloured PSX-style lighting: per-vertex normal x light direction
+- Up to 4 active lights per scene (PSX hardware limit feel)
+- Ambient + directional + point lights, no shadows
+- Vertex shader does the lighting maths — fragment stays simple
+
+### Milestone 8 — Asset pipeline
+- TGA → PSX-quantized texture (4-bit indexed, 256-colour palette)
+- OBJ → custom binary mesh format (`.pmesh`) — fast load, smaller files
+- Editor "Build assets" menu item runs the pipeline
+
+### Milestone 9 — Audio + scripting hooks
+- miniaudio integration for SFX and music
+- Per-node `script` component (Lua? Wren? deferred decision)
+- Engine calls script callbacks on update/collision/input events
 
 ---
 
@@ -244,7 +362,6 @@ Implementation order (do one step at a time, build between each):
 - Arch Linux, Sway/Wayland — no XWayland, no GLX
 - ThinkPad T480, Intel UHD 620 (KBL GT2), Mesa 26.0.6
 - `$TERMINAL` must be unset when launching Claude Code (`TERMINAL= claude`)
-  otherwise Sway intercepts new shells as Alacritty windows
 - vcpkg at `$HOME/vcpkg` (override: `VCPKG_DIR` env var)
 - Windows: `cmake/toolchain-mingw.cmake` + triplet `x64-mingw-static`
 
@@ -258,50 +375,11 @@ Implementation order (do one step at a time, build between each):
 - Use the Write tool to edit files directly — do not pipe large content via bash
 - **Always** `fprintf(stderr, ...)` for debug output — stdout is swallowed by SDL/Wayland
 
-## ImGui API notes
-- `DockSpaceOverViewport` signature: `DockSpaceOverViewport(0, ImGui::GetMainViewport())`
-  — the docking branch requires an explicit `dockspace_id` as first argument
+---
 
-## Milestone 3 progress
-
-### ✅ Step 1 — dockspace + empty panels
-Three dockable ImGui panels: Viewport, Outliner, Inspector.
-
-### ✅ Step 2 — viewport panel + orbit camera
-PSX FBO rendered inside Viewport panel via ImGui::Image (Y-flipped).
-OrbitCamera: MMB drag = orbit, Shift+MMB = pan, scroll = zoom.
-Numpad 1/3/7 = front/side/top snap, Numpad 5 = ortho/persp toggle.
-SDL cursor feedback: crosshair=orbit, sizeall=pan, arrow=idle.
-Left-click reserved for object selection (step 3+).
-
-### ✅ Step 3 — Outliner panel
-Flat list of scene objects, click to select/deselect, visibility toggle [v]/[ ].
-Note: emoji literals (u8"...") are incompatible with const char* in C++20 — use plain ASCII strings for ImGui labels.
-
-### ✅ Step 4 — Inspector panel
-Name (editable), Position/Rotation/Scale (DragFloat3). Edits SceneObject directly.
-Transform fields not yet connected to viewport render — wired in step 6+.
-
-### ✅ Step 5 — add/delete objects
-"+" button adds default SceneObject (auto-selected). Del key deletes selected.
-Post-deletion selection: previous object or -1 if list empty.
-SceneObject now has mesh_path and texture_path fields with defaults.
-
-### ✅ Step 6 — save/load .pscene + menubar
-Ctrl+S / Ctrl+O save and load scene.pscene (nlohmann JSON).
-SceneObject has collision field (default "box").
-Status message in Outliner fades after 2 seconds.
-Menubar: File (New/Open/Save/Quit), Edit (Add/Delete), View (snap + ortho toggle).
-Dockspace placed after BeginMainMenuBar so panels don't overlap the bar.
-
-### ✅ Step 7 — file pickers
-"..." button opens ImGui modal popup listing files from assets/meshes/ (.obj)
-and assets/textures/ (.tga/.png/.bmp). Click file → path updates, popup closes.
-Note: EndPopupModal does not exist — use EndPopup after BeginPopupModal.
-
-### ✅ Milestone 3 polish
-- Window title: "psx-editor — filename *" dirty indicator
-- Undo/redo: snapshot-based, max 50, Ctrl+Z/Y/Shift+Z
-- Ctrl+D duplicates selected object (name + " (copy)", offset 0.5/0/0.5)
-- Edit menu: Duplicate, Undo, Redo (grayed when unavailable)
-- SDL_Keymod cast fix: (SDL_Keymod)ev.key.keysym.mod
+## Known API gotchas
+- `DockSpaceOverViewport(0, ImGui::GetMainViewport())` — first arg is dockspace_id
+- `EndPopup` (not `EndPopupModal`) closes a `BeginPopupModal`
+- `(SDL_Keymod)ev.key.keysym.mod` — explicit cast required for SDL_Keymod
+- Emoji `u8"..."` literals are `char8_t*` in C++20 — incompatible with ImGui's `const char*`. Use ASCII `"[v]"` etc.
+- `LANGUAGES C CXX` in root CMakeLists — C is required for `vendor/glad/src/glad.c`

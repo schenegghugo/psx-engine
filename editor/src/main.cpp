@@ -12,8 +12,11 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <functional>
 
 #include <nlohmann/json.hpp>
+
+#include "scene_format.hpp"
 
 #include <SDL2/SDL.h>
 
@@ -33,6 +36,7 @@
 
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -323,6 +327,70 @@ static LoadedMesh generate_primitive(const char* type) {
         return r;
     }
 
+    if (std::string(type) == "capsule") {
+        // Cylinder body height 1 (y in [-0.5, 0.5]) + two hemispheres
+        // (radius 0.5) on top and bottom. Total y range [-1, 1] → bbox 1×2×1.
+        r.bbox_min = {-0.5f, -1.f, -0.5f};
+        r.bbox_max = { 0.5f,  1.f,  0.5f};
+        const int   slices    = 8;
+        const int   stacks    = 4;          // per hemisphere
+        const float radius    = 0.5f;
+        const float half_body = 0.5f;
+        const float c[] = {0.7f, 0.9f, 0.3f};
+        auto push = [&](float x, float y, float z, float u, float v) {
+            r.verts.insert(r.verts.end(), {x, y, z, u, v, c[0], c[1], c[2]});
+        };
+        // Cylinder body
+        for (int j = 0; j < slices; ++j) {
+            float a0 = 2.f * PI * (float)j       / slices;
+            float a1 = 2.f * PI * (float)(j + 1) / slices;
+            float x0 = radius * cosf(a0), z0 = radius * sinf(a0);
+            float x1 = radius * cosf(a1), z1 = radius * sinf(a1);
+            float u0 = (float)j / slices, u1 = (float)(j + 1) / slices;
+            push(x0,-half_body,z0, u0,0); push(x1,-half_body,z1, u1,0); push(x1, half_body,z1, u1,1);
+            push(x0,-half_body,z0, u0,0); push(x1, half_body,z1, u1,1); push(x0, half_body,z0, u0,1);
+        }
+        // Top hemisphere (lat 0..PI/2, centered on y = +half_body)
+        for (int i = 0; i < stacks; ++i) {
+            float lat0 = (PI * 0.5f) * (float)i       / stacks;
+            float lat1 = (PI * 0.5f) * (float)(i + 1) / stacks;
+            for (int j = 0; j < slices; ++j) {
+                float lon0 = 2.f * PI * (float)j       / slices;
+                float lon1 = 2.f * PI * (float)(j + 1) / slices;
+                auto p = [&](float lat, float lon) {
+                    float x = radius * cosf(lat) * cosf(lon);
+                    float y = half_body + radius * sinf(lat);
+                    float z = radius * cosf(lat) * sinf(lon);
+                    float u = lon / (2.f * PI);
+                    float v = lat / PI + 0.5f;
+                    push(x, y, z, u, v);
+                };
+                p(lat0, lon0); p(lat1, lon0); p(lat1, lon1);
+                p(lat0, lon0); p(lat1, lon1); p(lat0, lon1);
+            }
+        }
+        // Bottom hemisphere (lat -PI/2..0, centered on y = -half_body)
+        for (int i = 0; i < stacks; ++i) {
+            float lat0 = -(PI * 0.5f) + (PI * 0.5f) * (float)i       / stacks;
+            float lat1 = -(PI * 0.5f) + (PI * 0.5f) * (float)(i + 1) / stacks;
+            for (int j = 0; j < slices; ++j) {
+                float lon0 = 2.f * PI * (float)j       / slices;
+                float lon1 = 2.f * PI * (float)(j + 1) / slices;
+                auto p = [&](float lat, float lon) {
+                    float x = radius * cosf(lat) * cosf(lon);
+                    float y = -half_body + radius * sinf(lat);
+                    float z = radius * cosf(lat) * sinf(lon);
+                    float u = lon / (2.f * PI);
+                    float v = lat / PI + 0.5f;
+                    push(x, y, z, u, v);
+                };
+                p(lat0, lon0); p(lat1, lon0); p(lat1, lon1);
+                p(lat0, lon0); p(lat1, lon1); p(lat0, lon1);
+            }
+        }
+        return r;
+    }
+
     return make_unit_cube();  // fallback
 }
 
@@ -462,6 +530,141 @@ static std::vector<float> make_box_wire(glm::vec3 mn, glm::vec3 mx) {
             out.insert(out.end(), {p.x,p.y,p.z, 0,0, 1,1,1});
         }
     return out;
+}
+
+// ── Hierarchy helpers ────────────────────────────────────────────────────────
+static glm::mat4 world_matrix(const psx::Scene& s, int node_id) {
+    const psx::Node* n = s.find(node_id);
+    if (!n) return glm::mat4(1.f);
+    glm::mat4 local = glm::translate(glm::mat4(1.f), n->position);
+    local = local * glm::mat4_cast(n->rotation);
+    local = glm::scale(local, n->scale);
+    if (n->parent < 0) return local;
+    return world_matrix(s, n->parent) * local;
+}
+
+static glm::mat4 parent_world(const psx::Scene& s, int node_id) {
+    const psx::Node* n = s.find(node_id);
+    if (!n || n->parent < 0) return glm::mat4(1.f);
+    return world_matrix(s, n->parent);
+}
+
+// Like world_matrix but skips THIS node's own scale (parent scales still apply).
+// Used for indicator gizmos where size comes from a component value, not the
+// node transform.
+static glm::mat4 world_matrix_no_self_scale(const psx::Scene& s, int node_id) {
+    const psx::Node* n = s.find(node_id);
+    if (!n) return glm::mat4(1.f);
+    glm::mat4 m = parent_world(s, node_id);
+    m = glm::translate(m, n->position);
+    m = m * glm::mat4_cast(n->rotation);
+    return m;
+}
+
+// Decompose a TRS matrix into translation, rotation (as quaternion), and
+// scale. The rotation block is normalised before glm::quat_cast.
+static void decompose_trs_q(const glm::mat4& m, glm::vec3& t,
+                            glm::quat& q, glm::vec3& s) {
+    t = glm::vec3(m[3]);
+    glm::vec3 c0(m[0]), c1(m[1]), c2(m[2]);
+    s.x = glm::length(c0);
+    s.y = glm::length(c1);
+    s.z = glm::length(c2);
+    glm::mat3 R;
+    R[0] = (s.x > 1e-6f) ? c0 / s.x : glm::vec3(1.f, 0.f, 0.f);
+    R[1] = (s.y > 1e-6f) ? c1 / s.y : glm::vec3(0.f, 1.f, 0.f);
+    R[2] = (s.z > 1e-6f) ? c2 / s.z : glm::vec3(0.f, 0.f, 1.f);
+    q = glm::quat_cast(R);
+}
+
+// ── Wire-shape generators (line lists, 8 floats per vert: pos+uv+colour pad) ──
+static void wire_push(std::vector<float>& v, glm::vec3 p) {
+    v.insert(v.end(), {p.x, p.y, p.z, 0.f, 0.f, 1.f, 1.f, 1.f});
+}
+
+static std::vector<float> make_camera_wire() {
+    std::vector<float> v;
+    glm::vec3 apex(0.f, 0.f, 0.f);
+    glm::vec3 c0(-0.2f, -0.15f, -0.5f);
+    glm::vec3 c1( 0.2f, -0.15f, -0.5f);
+    glm::vec3 c2( 0.2f,  0.15f, -0.5f);
+    glm::vec3 c3(-0.2f,  0.15f, -0.5f);
+    // Apex → 4 base corners
+    wire_push(v, apex); wire_push(v, c0);
+    wire_push(v, apex); wire_push(v, c1);
+    wire_push(v, apex); wire_push(v, c2);
+    wire_push(v, apex); wire_push(v, c3);
+    // Base loop
+    wire_push(v, c0); wire_push(v, c1);
+    wire_push(v, c1); wire_push(v, c2);
+    wire_push(v, c2); wire_push(v, c3);
+    wire_push(v, c3); wire_push(v, c0);
+    // "Up" tent above the top edge
+    glm::vec3 tip(0.f, 0.25f, -0.5f);
+    wire_push(v, c3); wire_push(v, tip);
+    wire_push(v, tip); wire_push(v, c2);
+    return v;
+}
+
+static std::vector<float> make_dir_light_wire() {
+    std::vector<float> v;
+    // Square in the XZ plane at y=0
+    glm::vec3 a(-0.25f, 0.f, -0.25f);
+    glm::vec3 b( 0.25f, 0.f, -0.25f);
+    glm::vec3 c( 0.25f, 0.f,  0.25f);
+    glm::vec3 d(-0.25f, 0.f,  0.25f);
+    wire_push(v, a); wire_push(v, b);
+    wire_push(v, b); wire_push(v, c);
+    wire_push(v, c); wire_push(v, d);
+    wire_push(v, d); wire_push(v, a);
+    // Arrow: shaft (0,0,0) → (0,-1,0) plus arrowhead
+    glm::vec3 top(0.f, 0.f, 0.f), bot(0.f, -1.f, 0.f);
+    wire_push(v, top); wire_push(v, bot);
+    wire_push(v, bot); wire_push(v, glm::vec3(-0.1f, -0.85f, 0.f));
+    wire_push(v, bot); wire_push(v, glm::vec3( 0.1f, -0.85f, 0.f));
+    return v;
+}
+
+static std::vector<float> make_sphere_wire() {
+    // Three orthogonal great circles, 16 segments each.
+    std::vector<float> v;
+    static constexpr float PI2 = 6.28318530718f;
+    const int seg = 16;
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int i = 0; i < seg; ++i) {
+            float a0 = PI2 * (float)i       / seg;
+            float a1 = PI2 * (float)(i + 1) / seg;
+            glm::vec3 p0, p1;
+            if (axis == 0)      { p0 = {0.f, cosf(a0), sinf(a0)}; p1 = {0.f, cosf(a1), sinf(a1)}; }
+            else if (axis == 1) { p0 = {cosf(a0), 0.f, sinf(a0)}; p1 = {cosf(a1), 0.f, sinf(a1)}; }
+            else                { p0 = {cosf(a0), sinf(a0), 0.f}; p1 = {cosf(a1), sinf(a1), 0.f}; }
+            wire_push(v, p0); wire_push(v, p1);
+        }
+    }
+    return v;
+}
+
+static std::vector<float> make_cone_wire() {
+    // Apex at (0,0,0), unit cone pointing -Y, base at y=-1, radius 1.
+    std::vector<float> v;
+    static constexpr float PI2 = 6.28318530718f;
+    const int seg = 8;
+    glm::vec3 apex(0.f, 0.f, 0.f);
+    glm::vec3 base[8];
+    for (int i = 0; i < seg; ++i) {
+        float a = PI2 * (float)i / seg;
+        base[i] = {cosf(a), -1.f, sinf(a)};
+    }
+    for (int i = 0; i < seg; ++i) {
+        wire_push(v, base[i]);
+        wire_push(v, base[(i + 1) % seg]);
+    }
+    // 4 spokes from apex to every other base vertex.
+    for (int i = 0; i < 4; ++i) {
+        wire_push(v, apex);
+        wire_push(v, base[i * 2]);
+    }
+    return v;
 }
 
 // ── Scene I/O ─────────────────────────────────────────────────────────────────
@@ -621,14 +824,22 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
     GLint u_wire_mvp = glGetUniformLocation(wire_prog,"u_mvp");
     GLint u_wire_col = glGetUniformLocation(wire_prog,"u_wire_color");
 
+    // wire_vbo is shared between the box-collision overlay and the per-kind
+    // gizmo overlays (camera/light). Sized for the largest user (sphere wire =
+    // 96 verts).
     GLuint wire_vao=0, wire_vbo=0;
     glGenVertexArrays(1,&wire_vao); glGenBuffers(1,&wire_vbo);
     glBindVertexArray(wire_vao);
     glBindBuffer(GL_ARRAY_BUFFER,wire_vbo);
-    glBufferData(GL_ARRAY_BUFFER,24*8*sizeof(float),nullptr,GL_DYNAMIC_DRAW);
+    glBufferData(GL_ARRAY_BUFFER,128*8*sizeof(float),nullptr,GL_DYNAMIC_DRAW);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,8*sizeof(float),(void*)0);
     glBindVertexArray(0);
+
+    const std::vector<float> camera_wire_verts      = make_camera_wire();
+    const std::vector<float> dir_light_wire_verts   = make_dir_light_wire();
+    const std::vector<float> point_light_wire_verts = make_sphere_wire();
+    const std::vector<float> spot_light_wire_verts  = make_cone_wire();
 
     // ── PSX mesh shader ───────────────────────────────────────────────────────
     auto load_prog = [&](const char* v, const char* f) {
@@ -655,6 +866,7 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
             {"__primitive_sphere__",   "sphere"},
             {"__primitive_cylinder__", "cylinder"},
             {"__primitive_cone__",     "cone"},
+            {"__primitive_capsule__",  "capsule"},
         };
         for (auto& p : prims)
             mesh_cache[p.key] = upload_mesh(generate_primitive(p.type));
@@ -707,23 +919,96 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
     SDL_Cursor* cur_sizeall   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_SIZEALL);
 
     // ── Scene state ───────────────────────────────────────────────────────────
+    // scene is the structural truth (tree, kinds, components, node IDs).
+    // scene_objects is a derived mirror of mesh-kind nodes only — kept in
+    // scene.nodes declaration order — so the renderer + gizmo can keep
+    // using their existing shape until step 6 swaps them onto the tree.
     std::vector<SceneObject> scene_objects = {{"Cube"},{"Light"},{"Spawn Point"}};
-    int         selected_index = -1;
+    psx::Scene scene;
+    int         selected_node_id = -1;
+
+    // i-th mesh-kind node in scene.nodes order, or -1 if node_id isn't a mesh.
+    auto mesh_index_for_node = [&](int node_id) -> int {
+        int j = 0;
+        for (const auto& n : scene.nodes) {
+            if (n.kind != "mesh") continue;
+            if (n.id == node_id) return j;
+            ++j;
+        }
+        return -1;
+    };
+    // -1 unless the selected node is a mesh kind. Inspector/gizmo gate on this.
+    auto sel_idx = [&]() -> int { return mesh_index_for_node(selected_node_id); };
+
+    // Rebuild scene_objects to mirror current mesh nodes (scene.nodes order).
+    auto sync_objects_from_scene = [&]() {
+        scene_objects.clear();
+        for (const auto& n : scene.nodes) {
+            if (n.kind != "mesh") continue;
+            SceneObject obj;
+            obj.name     = n.name;
+            obj.position = n.position;
+            obj.rotation = glm::degrees(glm::eulerAngles(n.rotation));
+            obj.scale    = n.scale;
+            obj.visible  = n.visible;
+            nlohmann::json m = n.components.value("mesh", nlohmann::json::object());
+            obj.mesh_path    = m.value("path",    std::string(""));
+            obj.texture_path = m.value("texture", std::string(""));
+            nlohmann::json c = n.components.value("collision", nlohmann::json::object());
+            obj.collision    = c.value("type", std::string("box"));
+            scene_objects.push_back(std::move(obj));
+        }
+    };
+
+    // Build a fresh v1-shaped scene from scene_objects (used at startup and on
+    // .pscene v1 load — only mesh data exists in that path).
+    auto sync_scene_from_objects = [&]() {
+        scene = psx::Scene{};
+        scene.name = "untitled";
+        psx::Node root;
+        root.name = "Level"; root.kind = "node"; root.parent = -1;
+        int root_id = scene.add_node(std::move(root));
+        for (const auto& obj : scene_objects) {
+            psx::Node n;
+            n.name     = obj.name;
+            n.kind     = "mesh";
+            n.parent   = root_id;
+            n.position = obj.position;
+            n.rotation = glm::quat(glm::radians(obj.rotation));
+            n.scale    = obj.scale;
+            n.visible  = obj.visible;
+            n.components["mesh"]["path"]      = obj.mesh_path;
+            n.components["mesh"]["texture"]   = obj.texture_path;
+            n.components["collision"]["type"] = obj.collision;
+            scene.add_node(std::move(n));
+        }
+    };
+    sync_scene_from_objects();
     std::string status_msg;
     Uint32      status_until  = 0;
     FilePicker  picker;
     int         gizmo_op      = 0;      // 0=translate 1=rotate 2=scale
+    enum        { GIZMO_GLOBAL = 0, GIZMO_LOCAL = 1 };
+    int         gizmo_mode    = GIZMO_GLOBAL;
+    bool        snap_enabled    = false;
+    float       snap_translate  = 0.5f;
+    float       snap_rotate     = 15.f;
+    float       snap_scale      = 0.1f;
+    // Per-node "preferred Euler" (degrees) for the Inspector — derived from the
+    // quat on first display and held stable while the user types, so the Euler
+    // triple doesn't jump as the underlying quaternion is re-decomposed.
+    std::map<int, glm::vec3> preferred_euler_deg;
     std::string current_file;           // empty = untitled
     bool        scene_dirty   = false;
     std::string last_title;
 
     // ── Undo / redo ───────────────────────────────────────────────────────────
-    struct Snapshot { std::vector<SceneObject> objects; int selected; };
+    struct Snapshot { psx::Scene scene; int selected_node_id; };
     static constexpr int MAX_UNDO = 50;
     std::vector<Snapshot> undo_stack, redo_stack;
 
     auto push_undo = [&]() {
-        undo_stack.push_back({scene_objects, selected_index});
+        undo_stack.push_back({scene, selected_node_id});
         if ((int)undo_stack.size() > MAX_UNDO)
             undo_stack.erase(undo_stack.begin());
         redo_stack.clear();
@@ -731,19 +1016,23 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
 
     auto do_undo = [&]() {
         if (undo_stack.empty()) return;
-        redo_stack.push_back({scene_objects, selected_index});
-        scene_objects  = undo_stack.back().objects;
-        selected_index = undo_stack.back().selected;
+        redo_stack.push_back({scene, selected_node_id});
+        scene            = undo_stack.back().scene;
+        selected_node_id = undo_stack.back().selected_node_id;
         undo_stack.pop_back();
+        sync_objects_from_scene();
+        preferred_euler_deg.clear();
         scene_dirty = true;
     };
 
     auto do_redo = [&]() {
         if (redo_stack.empty()) return;
-        undo_stack.push_back({scene_objects, selected_index});
-        scene_objects  = redo_stack.back().objects;
-        selected_index = redo_stack.back().selected;
+        undo_stack.push_back({scene, selected_node_id});
+        scene            = redo_stack.back().scene;
+        selected_node_id = redo_stack.back().selected_node_id;
         redo_stack.pop_back();
+        sync_objects_from_scene();
+        preferred_euler_deg.clear();
         scene_dirty = true;
     };
 
@@ -758,7 +1047,11 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
     };
 
     auto do_load = [&]() {
-        load_scene(scene_objects, selected_index, "scene.pscene", status_msg);
+        int dummy = -1;
+        load_scene(scene_objects, dummy, "scene.pscene", status_msg);
+        selected_node_id = -1;
+        sync_scene_from_objects();
+        preferred_euler_deg.clear();
         status_until = SDL_GetTicks() + 2000;
         if (status_msg == "Loaded.") {
             scene_dirty  = false;
@@ -771,29 +1064,100 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
     auto do_new = [&]() {
         push_undo();
         scene_objects.clear();
-        selected_index = -1;
+        selected_node_id = -1;
+        sync_scene_from_objects();
+        preferred_euler_deg.clear();
         scene_dirty    = false;
         current_file   = "";
     };
 
+    // Add a new node under the currently-selected node (or the scene root if
+    // nothing is selected). Returns the freshly-assigned node id.
+    auto add_under_selected = [&](psx::Node n) -> int {
+        int parent_id = (selected_node_id >= 0 && scene.find(selected_node_id))
+                        ? selected_node_id : 0;
+        n.parent = parent_id;
+        return scene.add_node(std::move(n));
+    };
+
+    // "Add Object" menubar item: append a default mesh-from-file node.
     auto do_add = [&]() {
         push_undo();
-        SceneObject obj; obj.name = "Object";
-        scene_objects.push_back(std::move(obj));
-        selected_index = (int)scene_objects.size() - 1;
+        psx::Node n;
+        n.name = "Object";
+        n.kind = "mesh";
+        n.components["mesh"]["path"]      = "assets/meshes/test.obj";
+        n.components["mesh"]["texture"]   = "assets/textures/test.tga";
+        n.components["collision"]["type"] = "box";
+        selected_node_id = add_under_selected(std::move(n));
+        sync_objects_from_scene();
         scene_dirty = true;
     };
 
     auto do_dup = [&]() {
-        if (selected_index < 0 || selected_index >= (int)scene_objects.size()) return;
+        if (sel_idx() < 0) return;                   // mesh-only for now
+        psx::Node* original = scene.find(selected_node_id);
+        if (!original) return;
         push_undo();
-        SceneObject copy = scene_objects[selected_index];
+        psx::Node copy = *original;                  // deep copy of fields + json
+        copy.children.clear();                       // children not cloned in step 3
         copy.name       += " (copy)";
         copy.position.x += 0.5f;
         copy.position.z += 0.5f;
-        scene_objects.push_back(std::move(copy));
-        selected_index = (int)scene_objects.size() - 1;
+        // copy.parent inherits from original; add_node wires it into that parent.
+        selected_node_id = scene.add_node(std::move(copy));
+        sync_objects_from_scene();
         scene_dirty = true;
+    };
+
+    // Reparent dragged_id under new_parent_id, preserving world pose.
+    // Returns true if the reparent happened.
+    auto reparent = [&](int dragged_id, int new_parent_id) -> bool {
+        if (dragged_id == new_parent_id) return false;     // onto self
+        if (dragged_id == 0)             return false;     // root not movable
+        // Cycle: walk up from new_parent; if we encounter dragged_id, reject.
+        for (int cur = new_parent_id; cur >= 0; ) {
+            if (cur == dragged_id) return false;
+            const psx::Node* p = scene.find(cur);
+            if (!p) break;
+            cur = p->parent;
+        }
+        psx::Node* dragged    = scene.find(dragged_id);
+        psx::Node* new_parent = scene.find(new_parent_id);
+        if (!dragged || !new_parent) return false;
+        if (dragged->parent == new_parent_id) return false; // already there
+
+        push_undo();
+
+        // Snapshot world pose, then rewire parent/children.
+        glm::mat4 old_world = world_matrix(scene, dragged_id);
+
+        if (dragged->parent >= 0) {
+            if (psx::Node* old_parent = scene.find(dragged->parent)) {
+                auto& ch = old_parent->children;
+                ch.erase(std::remove(ch.begin(), ch.end(), dragged_id), ch.end());
+            }
+        }
+        dragged->parent = new_parent_id;
+        new_parent->children.push_back(dragged_id);
+
+        // Convert world pose to local under the new parent.
+        glm::mat4 new_pw    = world_matrix(scene, new_parent_id);
+        glm::mat4 new_local = glm::inverse(new_pw) * old_world;
+        glm::vec3 t, s;
+        glm::quat q;
+        decompose_trs_q(new_local, t, q, s);
+        dragged->position = t;
+        dragged->rotation = q;
+        dragged->scale    = s;
+        // Refresh the preferred-Euler entry so the Inspector shows the new
+        // local rotation rather than what was typed under the old parent.
+        preferred_euler_deg[dragged_id] =
+            glm::degrees(glm::eulerAngles(q));
+
+        sync_objects_from_scene();
+        scene_dirty = true;
+        return true;
     };
 
     OrbitCamera cam;
@@ -808,6 +1172,7 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
         bool key_del=false, key_save=false, key_load=false;
         bool key_t=false, key_r=false, key_s_gizmo=false;
         bool key_undo=false, key_redo=false, key_dup=false;
+        bool key_x_toggle=false;
 
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
@@ -849,6 +1214,7 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
                     case SDLK_d: if (mod & KMOD_CTRL) key_dup  = true; break;
                     case SDLK_t: key_t = true; break;
                     case SDLK_r: key_r = true; break;
+                    case SDLK_x: key_x_toggle = true; break;
                     default: break;
                 }
             }
@@ -857,6 +1223,8 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
         if (key_t)       gizmo_op = 0;
         if (key_r)       gizmo_op = 1;
         if (key_s_gizmo) gizmo_op = 2;
+        if (key_x_toggle && selected_node_id >= 0)
+            gizmo_mode = (gizmo_mode == GIZMO_GLOBAL) ? GIZMO_LOCAL : GIZMO_GLOBAL;
         if (key_undo)    do_undo();
         if (key_redo)    do_redo();
         if (key_dup)     do_dup();
@@ -874,16 +1242,15 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
 
         glUseProgram(mesh_prog);
         glUniform1f(u_snap, 60.f);
-        for (const SceneObject& obj : scene_objects) {
-            if (!obj.visible) continue;
-            glm::mat4 model = glm::translate(glm::mat4(1.f), obj.position);
-            model = glm::rotate(model, glm::radians(obj.rotation.x), {1,0,0});
-            model = glm::rotate(model, glm::radians(obj.rotation.y), {0,1,0});
-            model = glm::rotate(model, glm::radians(obj.rotation.z), {0,0,1});
-            model = glm::scale(model, obj.scale);
-            glm::mat4 mvp = vp * model;
-            MeshEntry& me = get_mesh(obj.mesh_path);
-            GLuint     tex = get_tex(obj.texture_path);
+        for (const psx::Node& n : scene.nodes) {
+            if (n.kind != "mesh") continue;
+            if (!n.visible) continue;
+            glm::mat4 mvp = vp * world_matrix(scene, n.id);
+            const auto mc = n.components.value("mesh", nlohmann::json::object());
+            std::string mesh_path = mc.value("path",    std::string(""));
+            std::string tex_path  = mc.value("texture", std::string(""));
+            MeshEntry& me  = get_mesh(mesh_path);
+            GLuint     tex = get_tex(tex_path);
             glUniformMatrix4fv(u_mvp,1,GL_FALSE,glm::value_ptr(mvp));
             glUniform1i(u_use_tex, tex ? 1 : 0);
             glActiveTexture(GL_TEXTURE0);
@@ -894,17 +1261,12 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
         }
         glBindVertexArray(0);
 
-        // Wireframe collision overlay for selected visible object
-        if (selected_index >= 0 && selected_index < (int)scene_objects.size()) {
-            const SceneObject& sel = scene_objects[selected_index];
+        // Wireframe collision overlay for selected visible mesh node
+        if (sel_idx() >= 0) {
+            const SceneObject& sel = scene_objects[sel_idx()];
             if (sel.visible && sel.collision != "none") {
                 MeshEntry& me = get_mesh(sel.mesh_path);
-                glm::mat4 model = glm::translate(glm::mat4(1.f), sel.position);
-                model = glm::rotate(model, glm::radians(sel.rotation.x), {1,0,0});
-                model = glm::rotate(model, glm::radians(sel.rotation.y), {0,1,0});
-                model = glm::rotate(model, glm::radians(sel.rotation.z), {0,0,1});
-                model = glm::scale(model, sel.scale);
-                glm::mat4 wire_mvp = vp * model;
+                glm::mat4 wire_mvp = vp * world_matrix(scene, selected_node_id);
                 glm::vec3 wcol =
                     sel.collision=="box"    ? glm::vec3{0.2f,1.0f,0.2f} :
                     sel.collision=="convex" ? glm::vec3{1.0f,0.9f,0.2f} :
@@ -928,6 +1290,65 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
                 glBindVertexArray(0);
                 glEnable(GL_DEPTH_TEST);
             }
+        }
+
+        // Per-kind gizmo overlays for visible non-mesh nodes (camera, light).
+        // Always rendered (independent of selection), depth-test off so they
+        // remain visible through geometry.
+        {
+            auto draw_wire = [&](const std::vector<float>& verts,
+                                 const glm::mat4& mvp,
+                                 const glm::vec3& color) {
+                glUniformMatrix4fv(u_wire_mvp, 1, GL_FALSE, glm::value_ptr(mvp));
+                glUniform3fv(u_wire_col, 1, glm::value_ptr(color));
+                glBindVertexArray(wire_vao);
+                glBindBuffer(GL_ARRAY_BUFFER, wire_vbo);
+                glBufferSubData(GL_ARRAY_BUFFER, 0,
+                                (GLsizeiptr)(verts.size() * sizeof(float)),
+                                verts.data());
+                glDrawArrays(GL_LINES, 0, (GLsizei)(verts.size() / 8));
+            };
+
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(wire_prog);
+            for (const psx::Node& n : scene.nodes) {
+                if (!n.visible) continue;
+                if (n.kind == "camera") {
+                    glm::mat4 mvp = vp * world_matrix(scene, n.id);
+                    draw_wire(camera_wire_verts, mvp, glm::vec3(1.f, 1.f, 1.f));
+                }
+                else if (n.kind == "light") {
+                    nlohmann::json lc = n.components.value(
+                        "light", nlohmann::json::object());
+                    std::string ltype = lc.value("type", std::string("directional"));
+                    glm::vec3 color(1.f, 1.f, 1.f);
+                    if (lc.contains("color") && lc["color"].is_array()
+                        && lc["color"].size() == 3) {
+                        color = { lc["color"][0].get<float>(),
+                                  lc["color"][1].get<float>(),
+                                  lc["color"][2].get<float>() };
+                    }
+                    if (ltype == "directional") {
+                        glm::mat4 mvp = vp * world_matrix(scene, n.id);
+                        draw_wire(dir_light_wire_verts, mvp, color);
+                    } else if (ltype == "point") {
+                        float radius = lc.value("radius", 1.f);
+                        glm::mat4 wm = glm::scale(
+                            world_matrix_no_self_scale(scene, n.id),
+                            glm::vec3(radius));
+                        draw_wire(point_light_wire_verts, vp * wm, color);
+                    } else if (ltype == "spot") {
+                        float radius = lc.value("radius", 1.f);
+                        float height = lc.value("height", 2.f);
+                        glm::mat4 wm = glm::scale(
+                            world_matrix_no_self_scale(scene, n.id),
+                            glm::vec3(radius, height, radius));
+                        draw_wire(spot_light_wire_verts, vp * wm, color);
+                    }
+                }
+            }
+            glBindVertexArray(0);
+            glEnable(GL_DEPTH_TEST);
         }
         psx_fb.unbind();
 
@@ -963,9 +1384,9 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
                 ImGui::Separator();
                 if (ImGui::MenuItem("Add Object"))
                     do_add();
-                if (ImGui::MenuItem("Duplicate Object","Ctrl+D",false,selected_index>=0))
+                if (ImGui::MenuItem("Duplicate Object","Ctrl+D",false,sel_idx()>=0))
                     do_dup();
-                if (ImGui::MenuItem("Delete Object",nullptr,false,selected_index>=0))
+                if (ImGui::MenuItem("Delete Object",nullptr,false,selected_node_id>0))
                     key_del = true;
                 ImGui::EndMenu();
             }
@@ -995,6 +1416,34 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
             if (key_np7) cam.snap_top();
             if (key_np5) cam.ortho = !cam.ortho;
 
+            // Toolbar: gizmo orientation mode + snap settings.
+            ImGui::Text("Gizmo:"); ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::Combo("##gizmo_mode", &gizmo_mode, "Global\0Local\0");
+            ImGui::SameLine();
+            ImGui::Checkbox("Snap", &snap_enabled);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("...##snap_settings"))
+                ImGui::OpenPopup("snap_settings_popup");
+            if (ImGui::BeginPopup("snap_settings_popup")) {
+                ImGui::TextUnformatted("Snap settings");
+                ImGui::Separator();
+                ImGui::DragFloat("Translate",    &snap_translate,
+                                 0.05f,  0.001f, 10.f, "%.3f");
+                ImGui::DragFloat("Rotate (deg)", &snap_rotate,
+                                 0.5f,   0.1f,   90.f, "%.2f");
+                ImGui::DragFloat("Scale",        &snap_scale,
+                                 0.005f, 0.001f, 1.f,  "%.3f");
+                if (ImGui::Button("Reset to defaults")) {
+                    snap_translate = 0.5f;
+                    snap_rotate    = 15.f;
+                    snap_scale     = 0.1f;
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::TextDisabled("[T] Translate  [R] Rotate  [S] Scale  |  "
+                                "Ctrl=Snap  Shift=Precision");
+
             ImVec2 avail = ImGui::GetContentRegionAvail();
             float fw = avail.x, fh = avail.y;
             if (fh>0.f && fw/fh > 4.f/3.f) fw = fh*(4.f/3.f);
@@ -1005,37 +1454,90 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
             ImGui::Image((ImTextureID)(intptr_t)psx_fb.tex, {fw,fh}, {0,1},{1,0});
 
 #ifdef HAVE_IMGUIZMO
-            if (selected_index>=0 && selected_index<(int)scene_objects.size()) {
-                SceneObject& sel = scene_objects[selected_index];
-                glm::mat4 view_mat = cam.view();
-                glm::mat4 proj_mat = cam.proj(fw/(fh>0?fh:1.f));
-                glm::mat4 model = glm::translate(glm::mat4(1.f), sel.position);
-                model = glm::rotate(model,glm::radians(sel.rotation.x),{1,0,0});
-                model = glm::rotate(model,glm::radians(sel.rotation.y),{0,1,0});
-                model = glm::rotate(model,glm::radians(sel.rotation.z),{0,0,1});
-                model = glm::scale(model, sel.scale);
+            if (selected_node_id >= 0) {
+                if (psx::Node* sel_node = scene.find(selected_node_id)) {
+                    glm::mat4 view_mat = cam.view();
+                    glm::mat4 proj_mat = cam.proj(fw/(fh>0?fh:1.f));
+                    // Gizmo manipulates the WORLD transform.
+                    glm::mat4 model = world_matrix(scene, selected_node_id);
 
-                ImGuizmo::SetOrthographic(cam.ortho);
-                ImGuizmo::SetDrawlist();
-                ImGuizmo::SetRect(img_screen.x, img_screen.y, fw, fh);
-                static const ImGuizmo::OPERATION ops[] = {
-                    ImGuizmo::TRANSLATE, ImGuizmo::ROTATE, ImGuizmo::SCALE
-                };
-                ImGuizmo::Manipulate(
-                    glm::value_ptr(view_mat), glm::value_ptr(proj_mat),
-                    ops[gizmo_op], ImGuizmo::LOCAL, glm::value_ptr(model));
+                    ImGuizmo::SetOrthographic(cam.ortho);
+                    ImGuizmo::SetDrawlist();
+                    ImGuizmo::SetRect(img_screen.x, img_screen.y, fw, fh);
+                    static const ImGuizmo::OPERATION ops[] = {
+                        ImGuizmo::TRANSLATE, ImGuizmo::ROTATE, ImGuizmo::SCALE
+                    };
+                    // ImGuizmo: WORLD = global axes, LOCAL = aligned to object.
+                    ImGuizmo::MODE imode = (gizmo_mode == GIZMO_LOCAL)
+                                           ? ImGuizmo::LOCAL : ImGuizmo::WORLD;
 
-                bool gizmo_using_now = ImGuizmo::IsUsing();
-                if (gizmo_using_now && !gizmo_was_using) push_undo();
-                if (gizmo_using_now) {
-                    float t[3],r[3],s[3];
-                    ImGuizmo::DecomposeMatrixToComponents(glm::value_ptr(model),t,r,s);
-                    sel.position = {t[0],t[1],t[2]};
-                    sel.rotation = {r[0],r[1],r[2]};
-                    sel.scale    = {s[0],s[1],s[2]};
-                    scene_dirty  = true;
+                    // Snap (toggle OR Ctrl) and precision (Shift) modifiers.
+                    SDL_Keymod kmod  = SDL_GetModState();
+                    bool ctrl_held   = (kmod & KMOD_CTRL)  != 0;
+                    bool shift_held  = (kmod & KMOD_SHIFT) != 0;
+                    bool snap_now    = snap_enabled || ctrl_held;
+                    float snap_arr[3] = {0.f, 0.f, 0.f};
+                    if (snap_now) {
+                        float v = (gizmo_op == 0) ? snap_translate
+                                : (gizmo_op == 1) ? snap_rotate
+                                                  : snap_scale;
+                        snap_arr[0] = snap_arr[1] = snap_arr[2] = v;
+                    }
+
+                    glm::mat4 prev_model = model;
+                    ImGuizmo::Manipulate(
+                        glm::value_ptr(view_mat), glm::value_ptr(proj_mat),
+                        ops[gizmo_op], imode, glm::value_ptr(model),
+                        nullptr,
+                        snap_now ? snap_arr : nullptr);
+
+                    bool gizmo_using_now = ImGuizmo::IsUsing();
+                    if (gizmo_using_now && !gizmo_was_using) push_undo();
+                    if (gizmo_using_now) {
+                        // Precision: blend manipulated → 10% of frame delta.
+                        if (shift_held) {
+                            glm::vec3 t_prev, t_new, s_prev, s_new;
+                            glm::quat r_prev, r_new;
+                            decompose_trs_q(prev_model, t_prev, r_prev, s_prev);
+                            decompose_trs_q(model,       t_new,  r_new,  s_new);
+                            glm::vec3 t = t_prev + (t_new - t_prev) * 0.1f;
+                            glm::quat r = glm::slerp(r_prev, r_new, 0.1f);
+                            glm::vec3 s = s_prev + (s_new - s_prev) * 0.1f;
+                            model = glm::translate(glm::mat4(1.f), t)
+                                  * glm::mat4_cast(r);
+                            model = glm::scale(model, s);
+                        }
+                        // Convert the new world matrix back to a local one.
+                        glm::mat4 pw = parent_world(scene, selected_node_id);
+                        glm::mat4 new_local = glm::inverse(pw) * model;
+                        float t[3], r[3], s[3];
+                        ImGuizmo::DecomposeMatrixToComponents(
+                            glm::value_ptr(new_local), t, r, s);
+                        glm::vec3 euler = {r[0], r[1], r[2]};
+                        sel_node->position = {t[0], t[1], t[2]};
+                        sel_node->rotation = glm::quat(glm::radians(euler));
+                        sel_node->scale    = {s[0], s[1], s[2]};
+                        // Keep the Inspector's preferred-Euler in step.
+                        preferred_euler_deg[selected_node_id] = euler;
+                        int mi = mesh_index_for_node(selected_node_id);
+                        if (mi >= 0 && mi < (int)scene_objects.size()) {
+                            scene_objects[mi].position = sel_node->position;
+                            scene_objects[mi].rotation = euler;
+                            scene_objects[mi].scale    = sel_node->scale;
+                        }
+                        scene_dirty  = true;
+                    }
+                    if (shift_held && gizmo_using_now) {
+                        ImVec2 corner = ImGui::GetWindowPos();
+                        ImVec2 sz = ImGui::GetWindowSize();
+                        ImGui::GetWindowDrawList()->AddText(
+                            ImVec2(corner.x + 10.f,
+                                   corner.y + sz.y - 26.f),
+                            IM_COL32(255, 220, 100, 255),
+                            "Precision");
+                    }
+                    gizmo_was_using = gizmo_using_now;
                 }
-                gizmo_was_using = gizmo_using_now;
             }
 #endif
         }
@@ -1045,130 +1547,498 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
         ImGui::Begin("Outliner");
         if (ImGui::Button("+")) ImGui::OpenPopup("add_object_popup");
         if (ImGui::BeginPopup("add_object_popup")) {
-            if (ImGui::MenuItem("From File")) do_add();
-            ImGui::Separator();
-            struct { const char* label; const char* key; } prims[] = {
-                {"Cube",     "__primitive_cube__"},
-                {"Plane",    "__primitive_plane__"},
-                {"Sphere",   "__primitive_sphere__"},
-                {"Cylinder", "__primitive_cylinder__"},
-                {"Cone",     "__primitive_cone__"},
-            };
-            for (auto& p : prims) {
-                if (ImGui::MenuItem(p.label)) {
-                    push_undo();
-                    SceneObject obj;
-                    obj.name         = p.label;
-                    obj.mesh_path    = p.key;
-                    obj.texture_path = "";
-                    obj.collision    = "box";
-                    scene_objects.push_back(std::move(obj));
-                    selected_index = (int)scene_objects.size() - 1;
-                    scene_dirty    = true;
+            // Empty Node ───────────────────────────────────────────────────
+            if (ImGui::MenuItem("Empty Node")) {
+                push_undo();
+                psx::Node n;
+                n.name = "Empty";
+                n.kind = "node";
+                selected_node_id = add_under_selected(std::move(n));
+                sync_objects_from_scene();
+                scene_dirty = true;
+            }
+            // Mesh ─────────────────────────────────────────────────────────
+            if (ImGui::BeginMenu("Mesh")) {
+                struct { const char* label; const char* path; } items[] = {
+                    {"From File", "assets/meshes/test.obj"},
+                    {"Cube",      "__primitive_cube__"},
+                    {"Plane",     "__primitive_plane__"},
+                    {"Sphere",    "__primitive_sphere__"},
+                    {"Cylinder",  "__primitive_cylinder__"},
+                    {"Cone",      "__primitive_cone__"},
+                    {"Capsule",   "__primitive_capsule__"},
+                };
+                for (auto& it : items) {
+                    if (ImGui::MenuItem(it.label)) {
+                        push_undo();
+                        psx::Node n;
+                        n.name = it.label;
+                        n.kind = "mesh";
+                        n.components["mesh"]["path"]      = it.path;
+                        n.components["mesh"]["texture"]   =
+                            std::string(it.path) == "assets/meshes/test.obj"
+                            ? "assets/textures/test.tga" : "";
+                        n.components["collision"]["type"] = "box";
+                        selected_node_id = add_under_selected(std::move(n));
+                        sync_objects_from_scene();
+                        scene_dirty = true;
+                    }
                 }
+                ImGui::EndMenu();
+            }
+            // Camera ───────────────────────────────────────────────────────
+            if (ImGui::MenuItem("Camera")) {
+                push_undo();
+                psx::Node n;
+                n.name = "Camera";
+                n.kind = "camera";
+                n.components["camera"]["fov"]  = 60;
+                n.components["camera"]["near"] = 0.1;
+                n.components["camera"]["far"]  = 100;
+                selected_node_id = add_under_selected(std::move(n));
+                sync_objects_from_scene();
+                scene_dirty = true;
+            }
+            // Light ────────────────────────────────────────────────────────
+            if (ImGui::BeginMenu("Light")) {
+                struct { const char* label; const char* type; } lights[] = {
+                    {"Directional", "directional"},
+                    {"Point",       "point"},
+                    {"Spot",        "spot"},
+                };
+                for (auto& l : lights) {
+                    if (ImGui::MenuItem(l.label)) {
+                        push_undo();
+                        psx::Node n;
+                        n.name = l.label;
+                        n.kind = "light";
+                        n.components["light"]["type"]      = l.type;
+                        n.components["light"]["color"]     = {1.0, 1.0, 1.0};
+                        n.components["light"]["intensity"] = 1.0;
+                        n.components["light"]["radius"]    = 1.0;
+                        n.components["light"]["height"]    = 2.0;
+                        selected_node_id = add_under_selected(std::move(n));
+                        sync_objects_from_scene();
+                        scene_dirty = true;
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            // Player (with auto-created Camera + Capsule children) ─────────
+            if (ImGui::MenuItem("Player")) {
+                push_undo();
+                psx::Node player;
+                player.name = "Player";
+                player.kind = "player";
+                player.components["spawn"]["is_default"] = true;
+                int player_id = add_under_selected(std::move(player));
+
+                psx::Node cam_node;
+                cam_node.name     = "Camera";
+                cam_node.kind     = "camera";
+                cam_node.parent   = player_id;
+                cam_node.position = {0.f, 1.5f, 0.f};
+                cam_node.components["camera"]["fov"]  = 60;
+                cam_node.components["camera"]["near"] = 0.1;
+                cam_node.components["camera"]["far"]  = 100;
+                scene.add_node(std::move(cam_node));
+
+                psx::Node cap;
+                cap.name     = "Capsule";
+                cap.kind     = "mesh";
+                cap.parent   = player_id;
+                cap.scale    = {0.5f, 1.f, 0.5f};
+                cap.components["mesh"]["path"]      = "__primitive_capsule__";
+                cap.components["mesh"]["texture"]   = "";
+                cap.components["collision"]["type"] = "convex";
+                scene.add_node(std::move(cap));
+
+                selected_node_id = player_id;
+                sync_objects_from_scene();
+                scene_dirty = true;
             }
             ImGui::EndPopup();
         }
         ImGui::Separator();
-        for (int i = 0; i < (int)scene_objects.size(); ++i) {
-            SceneObject& obj = scene_objects[i];
-            ImGui::PushID(i);
+
+        // Recursive tree walk over scene.nodes, rooted at parent==-1.
+        std::function<void(int)> draw_node = [&](int node_id) {
+            psx::Node* n = scene.find(node_id);
+            if (!n) return;
+
+            ImGui::PushID(node_id);
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.1f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.2f));
-            if (ImGui::SmallButton(obj.visible ? "[v]" : "[ ]")) {
+            if (ImGui::SmallButton(n->visible ? "[v]" : "[ ]")) {
                 push_undo();
-                obj.visible = !obj.visible;
+                n->visible = !n->visible;
+                int mi = mesh_index_for_node(node_id);
+                if (mi >= 0 && mi < (int)scene_objects.size())
+                    scene_objects[mi].visible = n->visible;
                 scene_dirty = true;
             }
             ImGui::PopStyleColor(3);
             ImGui::PopID();
             ImGui::SameLine();
-            bool sel = (i == selected_index);
-            if (ImGui::Selectable(obj.name.c_str(), sel, ImGuiSelectableFlags_SpanAllColumns))
-                selected_index = sel ? -1 : i;
-        }
+
+            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow
+                                     | ImGuiTreeNodeFlags_SpanAvailWidth
+                                     | ImGuiTreeNodeFlags_DefaultOpen;
+            if (n->children.empty()) flags |= ImGuiTreeNodeFlags_Leaf;
+            if (selected_node_id == node_id) flags |= ImGuiTreeNodeFlags_Selected;
+
+            bool open = ImGui::TreeNodeEx((void*)(intptr_t)node_id, flags,
+                                          "%s", n->name.c_str());
+            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+                selected_node_id = (selected_node_id == node_id) ? -1 : node_id;
+
+            // Drag source: payload = this node's id.
+            if (ImGui::BeginDragDropSource()) {
+                ImGui::SetDragDropPayload("PSX_NODE_ID", &node_id, sizeof(int));
+                ImGui::Text("%s", n->name.c_str());
+                ImGui::EndDragDropSource();
+            }
+            // Drop target: reparent dragged node onto this row.
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* payload =
+                        ImGui::AcceptDragDropPayload("PSX_NODE_ID")) {
+                    int dragged_id = *(const int*)payload->Data;
+                    reparent(dragged_id, node_id);
+                }
+                ImGui::EndDragDropTarget();
+            }
+
+            if (open) {
+                // Snapshot children — recursive callbacks may mutate the tree.
+                std::vector<int> kids = n->children;
+                for (int cid : kids) draw_node(cid);
+                ImGui::TreePop();
+            }
+        };
+
+        for (const psx::Node& root_n : scene.nodes)
+            if (root_n.parent == -1) draw_node(root_n.id);
+
         if (!status_msg.empty() && SDL_GetTicks() < status_until)
             ImGui::TextDisabled("%s", status_msg.c_str());
+
+        // Empty area below the tree → drop here to reparent to the scene root.
+        {
+            ImVec2 avail = ImGui::GetContentRegionAvail();
+            if (avail.x > 0.f && avail.y > 0.f) {
+                ImGui::InvisibleButton("##outliner_root_drop", avail);
+                if (ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload* payload =
+                            ImGui::AcceptDragDropPayload("PSX_NODE_ID")) {
+                        int dragged_id = *(const int*)payload->Data;
+                        reparent(dragged_id, 0);
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+            }
+        }
         ImGui::End();
 
-        // Deferred delete
-        if (key_del && selected_index>=0 && selected_index<(int)scene_objects.size()) {
+        // Deferred delete: any non-root node + its descendant subtree.
+        if (key_del && selected_node_id > 0 && scene.find(selected_node_id)) {
             push_undo();
-            scene_objects.erase(scene_objects.begin() + selected_index);
-            selected_index = selected_index>0 ? selected_index-1 : -1;
+            int del_root = selected_node_id;
+
+            // Collect del_root + all descendants.
+            std::vector<int> to_delete;
+            std::function<void(int)> collect = [&](int id) {
+                psx::Node* nn = scene.find(id);
+                if (!nn) return;
+                to_delete.push_back(id);
+                std::vector<int> kids = nn->children;
+                for (int cid : kids) collect(cid);
+            };
+            collect(del_root);
+
+            // Detach del_root from its parent's children list.
+            for (auto& other : scene.nodes) {
+                auto cit = std::find(other.children.begin(),
+                                     other.children.end(), del_root);
+                if (cit != other.children.end()) other.children.erase(cit);
+            }
+
+            // Erase all collected nodes from scene.nodes.
+            auto rit = std::remove_if(scene.nodes.begin(), scene.nodes.end(),
+                [&](const psx::Node& n) {
+                    return std::find(to_delete.begin(), to_delete.end(), n.id)
+                           != to_delete.end();
+                });
+            scene.nodes.erase(rit, scene.nodes.end());
+
+            // Drop preferred-Euler entries for everything we just removed.
+            for (int id : to_delete) preferred_euler_deg.erase(id);
+
+            selected_node_id = -1;
+            sync_objects_from_scene();
             scene_dirty = true;
         }
 
         // ── Inspector ─────────────────────────────────────────────────────────
         ImGui::Begin("Inspector");
-        if (selected_index>=0 && selected_index<(int)scene_objects.size()) {
-            SceneObject& obj = scene_objects[selected_index];
+        if (psx::Node* node = (selected_node_id >= 0)
+                              ? scene.find(selected_node_id) : nullptr) {
+            const int mi = mesh_index_for_node(selected_node_id);
 
-            // Name
-            char name_buf[256];
-            std::snprintf(name_buf, sizeof(name_buf), "%s", obj.name.c_str());
-            if (ImGui::InputText("Name", name_buf, sizeof(name_buf))) {
-                obj.name = name_buf; scene_dirty = true;
-            }
-            if (ImGui::IsItemActivated()) push_undo();
-
-            // Assets
-            ImGui::Separator(); ImGui::Text("Assets");
-
-            auto path_field = [&](const char* label, std::string& path,
-                                  const char* dir,
-                                  std::initializer_list<const char*> exts,
-                                  const char* fid) {
-                ImGui::AlignTextToFramePadding();
-                ImGui::Text("%s", label); ImGui::SameLine();
-                char buf[512]; std::snprintf(buf, sizeof(buf), "%s", path.c_str());
-                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 35.f);
-                char in_id[32], btn_id[32];
-                std::snprintf(in_id,  sizeof(in_id),  "##%s_in",  fid);
-                std::snprintf(btn_id, sizeof(btn_id),  "...##%s",  fid);
-                if (ImGui::InputText(in_id, buf, sizeof(buf))) {
-                    path = buf; scene_dirty = true;
+            // Name + kind badge ───────────────────────────────────────────
+            {
+                char name_buf[256];
+                std::snprintf(name_buf, sizeof(name_buf), "%s", node->name.c_str());
+                if (ImGui::InputText("Name", name_buf, sizeof(name_buf))) {
+                    node->name = name_buf;
+                    if (mi >= 0 && mi < (int)scene_objects.size())
+                        scene_objects[mi].name = name_buf;
+                    scene_dirty = true;
                 }
                 if (ImGui::IsItemActivated()) push_undo();
                 ImGui::SameLine();
-                if (ImGui::Button(btn_id)) picker.open(&path, dir, exts);
+                ImGui::TextDisabled("[%s]", node->kind.c_str());
+            }
+
+            // Transform (every kind) ───────────────────────────────────────
+            if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::DragFloat3("Position", &node->position.x, 0.1f);
+                if (ImGui::IsItemActivated()) push_undo();
+                if (ImGui::IsItemEdited()) {
+                    if (mi >= 0 && mi < (int)scene_objects.size())
+                        scene_objects[mi].position = node->position;
+                    scene_dirty = true;
+                }
+                // Rotation is stored as a quaternion on the node, but the
+                // Inspector edits Euler XYZ in degrees. Hold a stable Euler
+                // per-node so the triple doesn't jump as the underlying quat
+                // is decomposed.
+                auto pit = preferred_euler_deg.find(node->id);
+                if (pit == preferred_euler_deg.end()) {
+                    glm::vec3 e = glm::degrees(glm::eulerAngles(node->rotation));
+                    pit = preferred_euler_deg.emplace(node->id, e).first;
+                }
+                glm::vec3& euler_deg = pit->second;
+                ImGui::DragFloat3("Rotation", &euler_deg.x, 1.0f);
+                if (ImGui::IsItemActivated()) push_undo();
+                if (ImGui::IsItemEdited()) {
+                    node->rotation = glm::quat(glm::radians(euler_deg));
+                    if (mi >= 0 && mi < (int)scene_objects.size())
+                        scene_objects[mi].rotation = euler_deg;
+                    scene_dirty = true;
+                }
+                ImGui::DragFloat3("Scale", &node->scale.x, 0.01f, 0.001f, FLT_MAX, "%.3f");
+                if (ImGui::IsItemActivated()) push_undo();
+                if (ImGui::IsItemEdited()) {
+                    if (mi >= 0 && mi < (int)scene_objects.size())
+                        scene_objects[mi].scale = node->scale;
+                    scene_dirty = true;
+                }
+            }
+
+            // Helper: ensure a json subobject exists, return reference.
+            auto ensure_obj = [&](const char* key) -> nlohmann::json& {
+                auto& slot = node->components[key];
+                if (!slot.is_object()) slot = nlohmann::json::object();
+                return slot;
             };
 
-            path_field("Mesh",    obj.mesh_path,    "assets/meshes/",   {".obj"},            "mesh");
+            // ── kind == "mesh" ────────────────────────────────────────────
+            if (node->kind == "mesh" && mi >= 0
+                && mi < (int)scene_objects.size())
             {
-                auto wit = validation_warnings.find(obj.mesh_path);
-                if (wit != validation_warnings.end())
-                    for (const auto& w : wit->second)
-                        ImGui::TextColored({1.f, 0.85f, 0.f, 1.f}, "! %s", w.c_str());
+                SceneObject& obj = scene_objects[mi];
+                auto path_field = [&](const char* label, std::string& path,
+                                      const char* component_key,
+                                      const char* field_key,
+                                      const char* dir,
+                                      std::initializer_list<const char*> exts,
+                                      const char* fid) {
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::Text("%s", label); ImGui::SameLine();
+                    char buf[512]; std::snprintf(buf, sizeof(buf), "%s", path.c_str());
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 35.f);
+                    char in_id[32], btn_id[32];
+                    std::snprintf(in_id,  sizeof(in_id),  "##%s_in", fid);
+                    std::snprintf(btn_id, sizeof(btn_id), "...##%s", fid);
+                    if (ImGui::InputText(in_id, buf, sizeof(buf))) {
+                        path = buf;
+                        ensure_obj(component_key)[field_key] = buf;
+                        scene_dirty = true;
+                    }
+                    if (ImGui::IsItemActivated()) push_undo();
+                    ImGui::SameLine();
+                    if (ImGui::Button(btn_id)) picker.open(&path, dir, exts);
+                };
+
+                if (ImGui::CollapsingHeader("Mesh", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    path_field("Path",    obj.mesh_path,    "mesh", "path",
+                               "assets/meshes/",   {".obj"},                "mesh");
+                    auto wit = validation_warnings.find(obj.mesh_path);
+                    if (wit != validation_warnings.end())
+                        for (const auto& w : wit->second)
+                            ImGui::TextColored({1.f, 0.85f, 0.f, 1.f}, "! %s", w.c_str());
+                    path_field("Texture", obj.texture_path, "mesh", "texture",
+                               "assets/textures/", {".tga",".png",".bmp"}, "tex");
+                }
+                if (ImGui::CollapsingHeader("Collision", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    const char* coll_items[] = {"none","box","mesh","convex"};
+                    int coll_idx = 0;
+                    for (int ci = 0; ci < 4; ++ci)
+                        if (obj.collision == coll_items[ci]) { coll_idx = ci; break; }
+                    if (ImGui::Combo("Type", &coll_idx, coll_items, 4)) {
+                        push_undo();
+                        obj.collision = coll_items[coll_idx];
+                        ensure_obj("collision")["type"] = obj.collision;
+                        scene_dirty = true;
+                    }
+                }
             }
-            path_field("Texture", obj.texture_path, "assets/textures/", {".tga",".png",".bmp"}, "tex");
+            // ── kind == "camera" ──────────────────────────────────────────
+            else if (node->kind == "camera") {
+                if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    auto& cam_c = ensure_obj("camera");
 
-            // Transform
-            ImGui::Separator(); ImGui::Text("Transform");
-            ImGui::DragFloat3("Position", &obj.position.x, 0.1f);
-            if (ImGui::IsItemActivated()) push_undo();
-            if (ImGui::IsItemEdited())    scene_dirty = true;
+                    float fov = cam_c.value("fov", 60.f);
+                    if (ImGui::DragFloat("FOV", &fov, 0.5f, 1.f, 179.f, "%.1f")) {
+                        cam_c["fov"] = fov; scene_dirty = true;
+                    }
+                    if (ImGui::IsItemActivated()) push_undo();
 
-            ImGui::DragFloat3("Rotation", &obj.rotation.x, 1.0f);
-            if (ImGui::IsItemActivated()) push_undo();
-            if (ImGui::IsItemEdited())    scene_dirty = true;
+                    float near_p = cam_c.value("near", 0.1f);
+                    if (ImGui::DragFloat("Near", &near_p, 0.01f, 0.01f, 10.f, "%.2f")) {
+                        cam_c["near"] = near_p; scene_dirty = true;
+                    }
+                    if (ImGui::IsItemActivated()) push_undo();
 
-            ImGui::DragFloat3("Scale", &obj.scale.x, 0.01f, 0.001f, FLT_MAX, "%.3f");
-            if (ImGui::IsItemActivated()) push_undo();
-            if (ImGui::IsItemEdited())    scene_dirty = true;
+                    float far_p = cam_c.value("far", 100.f);
+                    if (ImGui::DragFloat("Far", &far_p, 0.5f, 1.f, 1000.f, "%.1f")) {
+                        cam_c["far"] = far_p; scene_dirty = true;
+                    }
+                    if (ImGui::IsItemActivated()) push_undo();
 
-            // Physics
-            ImGui::Separator(); ImGui::Text("Physics");
-            const char* coll_items[] = {"none","box","mesh","convex"};
-            int coll_idx = 0;
-            for (int ci = 0; ci < 4; ++ci)
-                if (obj.collision == coll_items[ci]) { coll_idx = ci; break; }
-            if (ImGui::Combo("Collision", &coll_idx, coll_items, 4)) {
-                push_undo();
-                obj.collision = coll_items[coll_idx];
-                scene_dirty   = true;
+                    bool active = cam_c.value("is_active", false);
+                    if (ImGui::Checkbox("Active camera", &active)) {
+                        push_undo();
+                        if (active) {
+                            for (auto& other : scene.nodes) {
+                                if (other.kind != "camera" || other.id == node->id)
+                                    continue;
+                                auto& oc = other.components["camera"];
+                                if (!oc.is_object()) oc = nlohmann::json::object();
+                                oc["is_active"] = false;
+                            }
+                        }
+                        cam_c["is_active"] = active;
+                        scene_dirty = true;
+                    }
+                }
             }
+            // ── kind == "light" ───────────────────────────────────────────
+            else if (node->kind == "light") {
+                if (ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    auto& lc = ensure_obj("light");
+
+                    const char* type_items[] = {"directional","point","spot"};
+                    std::string current_type =
+                        lc.value("type", std::string("directional"));
+                    int type_idx = 0;
+                    for (int ti = 0; ti < 3; ++ti)
+                        if (current_type == type_items[ti]) { type_idx = ti; break; }
+                    if (ImGui::Combo("Type", &type_idx, type_items, 3)) {
+                        push_undo();
+                        lc["type"] = type_items[type_idx];
+                        current_type = type_items[type_idx];
+                        scene_dirty = true;
+                    }
+
+                    float color[3] = {1.f, 1.f, 1.f};
+                    if (lc.contains("color") && lc["color"].is_array()
+                        && lc["color"].size() == 3) {
+                        color[0] = lc["color"][0].get<float>();
+                        color[1] = lc["color"][1].get<float>();
+                        color[2] = lc["color"][2].get<float>();
+                    }
+                    if (ImGui::ColorEdit3("Color", color)) {
+                        lc["color"] = {color[0], color[1], color[2]};
+                        scene_dirty = true;
+                    }
+                    if (ImGui::IsItemActivated()) push_undo();
+
+                    float intensity = lc.value("intensity", 1.f);
+                    if (ImGui::DragFloat("Intensity", &intensity, 0.05f, 0.f, 10.f, "%.2f")) {
+                        lc["intensity"] = intensity;
+                        scene_dirty = true;
+                    }
+                    if (ImGui::IsItemActivated()) push_undo();
+
+                    if (current_type == "point" || current_type == "spot") {
+                        float radius = lc.value("radius", 1.f);
+                        if (ImGui::DragFloat("Radius", &radius, 0.1f, 0.1f, 50.f, "%.2f")) {
+                            lc["radius"] = radius;
+                            scene_dirty = true;
+                        }
+                        if (ImGui::IsItemActivated()) push_undo();
+                    }
+                    if (current_type == "spot") {
+                        float height = lc.value("height", 2.f);
+                        if (ImGui::DragFloat("Height", &height, 0.1f, 0.1f, 50.f, "%.2f")) {
+                            lc["height"] = height;
+                            scene_dirty = true;
+                        }
+                        if (ImGui::IsItemActivated()) push_undo();
+                    }
+                }
+            }
+            // ── kind == "player" ──────────────────────────────────────────
+            else if (node->kind == "player") {
+                if (ImGui::CollapsingHeader("Spawn", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    auto& sc = ensure_obj("spawn");
+                    bool is_default = sc.value("is_default", false);
+                    if (ImGui::Checkbox("Default spawn", &is_default)) {
+                        push_undo();
+                        if (is_default) {
+                            for (auto& other : scene.nodes) {
+                                if (other.kind != "player" || other.id == node->id)
+                                    continue;
+                                auto& os = other.components["spawn"];
+                                if (!os.is_object()) os = nlohmann::json::object();
+                                os["is_default"] = false;
+                            }
+                        }
+                        sc["is_default"] = is_default;
+                        scene_dirty = true;
+                    }
+                }
+                if (ImGui::CollapsingHeader("Controller", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    auto& cc = ensure_obj("controller");
+
+                    const char* type_items[] = {"fps","orbit","scripted"};
+                    std::string current_type = cc.value("type", std::string("fps"));
+                    int type_idx = 0;
+                    for (int ci = 0; ci < 3; ++ci)
+                        if (current_type == type_items[ci]) { type_idx = ci; break; }
+                    if (ImGui::Combo("Type", &type_idx, type_items, 3)) {
+                        push_undo();
+                        cc["type"] = type_items[type_idx];
+                        scene_dirty = true;
+                    }
+
+                    float speed = cc.value("speed", 5.f);
+                    if (ImGui::DragFloat("Speed", &speed, 0.1f, 0.f, 100.f, "%.2f")) {
+                        cc["speed"] = speed; scene_dirty = true;
+                    }
+                    if (ImGui::IsItemActivated()) push_undo();
+
+                    float sens = cc.value("mouse_sensitivity", 0.1f);
+                    if (ImGui::DragFloat("Mouse sensitivity", &sens,
+                                         0.005f, 0.f, 5.f, "%.3f")) {
+                        cc["mouse_sensitivity"] = sens; scene_dirty = true;
+                    }
+                    if (ImGui::IsItemActivated()) push_undo();
+                }
+            }
+            // kind == "node" → name + transform only, no extra sections.
 
 #ifdef HAVE_IMGUIZMO
             ImGui::Separator();
@@ -1189,6 +2059,12 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
                         push_undo();
                         if (picker.dest) *picker.dest = fp;
                         picker.dest  = nullptr;
+                        if (psx::Node* nn = scene.find(selected_node_id);
+                            nn && sel_idx() >= 0) {
+                            const SceneObject& obj = scene_objects[sel_idx()];
+                            nn->components["mesh"]["path"]    = obj.mesh_path;
+                            nn->components["mesh"]["texture"] = obj.texture_path;
+                        }
                         scene_dirty  = true;
                         ImGui::CloseCurrentPopup();
                     }
