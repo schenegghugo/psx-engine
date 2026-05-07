@@ -201,4 +201,40 @@ inline void save_scene(const Scene& s, const std::string& path) {
     f << nlohmann::json(s).dump(2);
 }
 
+// ── Project ──────────────────────────────────────────────────────────────────
+// A project is a directory: <root>/project.psxproj + assets/{meshes,textures}/
+// + scenes/. Asset paths inside .pscene files are interpreted relative to
+// <root> when the editor has a project loaded.
+struct Project {
+    int         format_version = 1;
+    std::string name;
+    std::string default_scene; // relative to project root, e.g. "scenes/level1.pscene"
+};
+
+inline void to_json(nlohmann::json& j, const Project& p) {
+    j = nlohmann::json{
+        {"format_version", p.format_version},
+        {"name",           p.name},
+        {"default_scene",  p.default_scene},
+    };
+}
+
+inline void from_json(const nlohmann::json& j, Project& p) {
+    p.format_version = j.value("format_version", 1);
+    p.name           = j.value("name",           std::string(""));
+    p.default_scene  = j.value("default_scene",  std::string(""));
+}
+
+inline Project load_project(const std::string& path) {
+    std::ifstream f(path);
+    if (!f) throw std::runtime_error("Cannot open project: " + path);
+    return nlohmann::json::parse(f).get<Project>();
+}
+
+inline void save_project(const Project& p, const std::string& path) {
+    std::ofstream f(path);
+    if (!f) throw std::runtime_error("Cannot write project: " + path);
+    f << nlohmann::json(p).dump(2);
+}
+
 } // namespace psx

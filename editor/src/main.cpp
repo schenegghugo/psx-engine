@@ -1,6 +1,7 @@
 // psx-editor — milestone 3 + built-in primitive meshes
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <cfloat>
 #include <string>
@@ -13,6 +14,13 @@
 #include <cctype>
 #include <filesystem>
 #include <functional>
+#if defined(_WIN32)
+#  include <process.h>          // _getpid
+#  define psx_getpid() _getpid()
+#else
+#  include <unistd.h>           // getpid
+#  define psx_getpid() getpid()
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -44,6 +52,178 @@ static std::string read_file(const char* path) {
     std::ifstream f(path);
     if (!f) { fprintf(stderr, "Cannot open: %s\n", path); return ""; }
     std::ostringstream ss; ss << f.rdbuf(); return ss.str();
+}
+
+// ── Built-in ImGui file browser ──────────────────────────────────────────────
+// Self-contained — no external dependency on zenity / kdialog / yazi / etc.
+// Three modes: pick an existing file, save to a (possibly new) file, pick a
+// directory. The Browse buttons in the New Project + Save Scene As modals
+// open this; other tools can be plugged in by users via the
+// $PSX_FILE_PICKER env var (handled at the call site).
+struct FsBrowser {
+    enum Mode { OPEN_FILE, SAVE_FILE, OPEN_DIR };
+    Mode        mode  = OPEN_FILE;
+    std::string title;
+    std::string cwd;            // absolute path of the currently-displayed dir
+    char        filename[256]   = "";
+    std::vector<std::string>                exts;       // [".pscene"], empty = any
+    std::function<void(const std::string&)> on_accept;  // called on Save/Open
+    bool        open_request = false;                   // set to pop the modal
+};
+
+static void fs_browser_render(FsBrowser& b) {
+    namespace fs = std::filesystem;
+
+    if (b.open_request) {
+        ImGui::OpenPopup("##fs_browser");
+        b.open_request = false;
+    }
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, {0.5f, 0.5f});
+    ImGui::SetNextWindowSize({640.f, 480.f}, ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("##fs_browser", nullptr,
+                                ImGuiWindowFlags_NoSavedSettings))
+        return;
+
+    ImGui::TextUnformatted(b.title.c_str());
+    ImGui::Separator();
+
+    // Path bar
+    if (ImGui::Button("..")) {
+        fs::path p(b.cwd);
+        if (p.has_parent_path()) b.cwd = p.parent_path().string();
+    }
+    ImGui::SameLine();
+    ImGui::TextUnformatted(b.cwd.c_str());
+    ImGui::Separator();
+
+    // Build entry list — directories first, then matching files.
+    std::error_code ec;
+    struct Entry { std::string name; bool is_dir; };
+    std::vector<Entry> entries;
+    for (const auto& e : fs::directory_iterator(b.cwd, ec)) {
+        std::string name = e.path().filename().string();
+        if (name.empty() || name[0] == '.') continue;   // skip hidden
+        const bool is_dir = e.is_directory(ec);
+        if (!is_dir) {
+            if (b.mode == FsBrowser::OPEN_DIR) continue;
+            if (!b.exts.empty()) {
+                std::string ext = e.path().extension().string();
+                for (char& c : ext) c = (char)std::tolower((unsigned char)c);
+                bool match = false;
+                for (const auto& want : b.exts) {
+                    std::string lw = want;
+                    for (char& c : lw) c = (char)std::tolower((unsigned char)c);
+                    if (ext == lw) { match = true; break; }
+                }
+                if (!match) continue;
+            }
+        }
+        entries.push_back({std::move(name), is_dir});
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& bb) {
+                  if (a.is_dir != bb.is_dir) return a.is_dir;
+                  return a.name < bb.name;
+              });
+
+    bool accept = false;
+    ImGui::BeginChild("##fs_list", {0, -64}, true);
+    for (const auto& e : entries) {
+        const std::string label = (e.is_dir ? "[D] " : "    ") + e.name;
+        if (ImGui::Selectable(label.c_str(), false,
+                              ImGuiSelectableFlags_AllowDoubleClick)) {
+            if (e.is_dir) {
+                if (ImGui::IsMouseDoubleClicked(0))
+                    b.cwd = (fs::path(b.cwd) / e.name).string();
+            } else {
+                std::snprintf(b.filename, sizeof(b.filename),
+                              "%s", e.name.c_str());
+                if (ImGui::IsMouseDoubleClicked(0)) accept = true;
+            }
+        }
+    }
+    ImGui::EndChild();
+
+    if (b.mode != FsBrowser::OPEN_DIR) {
+        ImGui::Text("Filename:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##fs_filename", b.filename, sizeof(b.filename));
+    }
+
+    const char* accept_label =
+        b.mode == FsBrowser::OPEN_DIR  ? "Select" :
+        b.mode == FsBrowser::SAVE_FILE ? "Save"   : "Open";
+    const bool can_accept =
+        (b.mode == FsBrowser::OPEN_DIR) || (b.filename[0] != '\0');
+    ImGui::BeginDisabled(!can_accept);
+    if (ImGui::Button(accept_label, {120, 0})) accept = true;
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", {120, 0})) {
+        b.on_accept = nullptr;
+        ImGui::CloseCurrentPopup();
+    }
+
+    if (accept) {
+        std::string out = (b.mode == FsBrowser::OPEN_DIR)
+            ? b.cwd
+            : (fs::path(b.cwd) / b.filename).string();
+        auto cb = std::move(b.on_accept);
+        b.on_accept = nullptr;
+        ImGui::CloseCurrentPopup();
+        if (cb) cb(out);
+    }
+
+    ImGui::EndPopup();
+}
+
+// Optional escape hatch: if the user has set $PSX_FILE_PICKER, run that
+// command instead of opening the built-in browser. The template should
+// contain `{out}` somewhere — we replace it with a temp file path and read
+// the picked path from that file after the command exits. This blocks the
+// main loop until the external picker closes (yazi, fzf-in-a-terminal, etc.).
+//
+// Example: PSX_FILE_PICKER='foot -e yazi --chooser-file={out}'
+static std::string run_external_picker() {
+    const char* tmpl_c = std::getenv("PSX_FILE_PICKER");
+    if (!tmpl_c || !*tmpl_c) return std::string();
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path tmp = fs::temp_directory_path(ec)
+                 / ("psx_picker_" + std::to_string((long)psx_getpid()) + ".txt");
+    // Make sure the file exists and is empty so a clean cancel returns "".
+    { std::ofstream(tmp.string()).close(); }
+
+    std::string cmd = tmpl_c;
+    const std::string token = "{out}";
+    for (size_t pos = cmd.find(token); pos != std::string::npos;
+         pos = cmd.find(token, pos))
+    {
+        // Single-quote-escape the temp path before substituting.
+        std::string q = "'";
+        for (char c : tmp.string()) q += (c == '\'') ? std::string("'\\''")
+                                                     : std::string(1, c);
+        q += "'";
+        cmd.replace(pos, token.size(), q);
+        pos += q.size();
+    }
+
+    int rc = std::system(cmd.c_str());
+    (void)rc;
+
+    std::string result;
+    {
+        std::ifstream f(tmp.string());
+        std::getline(f, result);
+    }
+    fs::remove(tmp, ec);
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
+        result.pop_back();
+    return result;
 }
 
 static GLuint compile_shader(GLenum type, const char* src) {
@@ -533,6 +713,16 @@ static std::vector<float> make_box_wire(glm::vec3 mn, glm::vec3 mx) {
 }
 
 // ── Hierarchy helpers ────────────────────────────────────────────────────────
+// A node is visible only if every ancestor up to the root is also visible.
+// A toggle on the Level root therefore hides the entire subtree.
+static bool node_visible(const psx::Scene& s, int node_id) {
+    const psx::Node* n = s.find(node_id);
+    if (!n)              return false;
+    if (!n->visible)     return false;
+    if (n->parent < 0)   return true;
+    return node_visible(s, n->parent);
+}
+
 static glm::mat4 world_matrix(const psx::Scene& s, int node_id) {
     const psx::Node* n = s.find(node_id);
     if (!n) return glm::mat4(1.f);
@@ -668,57 +858,10 @@ static std::vector<float> make_cone_wire() {
 }
 
 // ── Scene I/O ─────────────────────────────────────────────────────────────────
-static void save_scene(const std::vector<SceneObject>& objects,
-                       const char* path, std::string& status) {
-    using json = nlohmann::json;
-    json root; root["name"] = "untitled"; root["objects"] = json::array();
-    for (const auto& obj : objects) {
-        json o;
-        o["name"]         = obj.name;
-        o["mesh_path"]    = obj.mesh_path;
-        o["texture_path"] = obj.texture_path;
-        o["position"]     = {obj.position.x, obj.position.y, obj.position.z};
-        o["rotation"]     = {obj.rotation.x, obj.rotation.y, obj.rotation.z};
-        o["scale"]        = {obj.scale.x,    obj.scale.y,    obj.scale.z};
-        o["visible"]      = obj.visible;
-        o["collision"]    = obj.collision;
-        root["objects"].push_back(o);
-    }
-    std::ofstream f(path);
-    if (!f) { status = "Error."; return; }
-    f << root.dump(2);
-    status = "Saved.";
-    fprintf(stderr, "scene: saved %zu objects -> %s\n", objects.size(), path);
-}
-
-static void load_scene(std::vector<SceneObject>& objects, int& selected_index,
-                       const char* path, std::string& status) {
-    using json = nlohmann::json;
-    std::ifstream f(path);
-    if (!f) { status = "Error."; return; }
-    json root;
-    try { root = json::parse(f); } catch (...) { status = "Error."; return; }
-    objects.clear();
-    for (const auto& o : root.value("objects", json::array())) {
-        SceneObject obj;
-        obj.name         = o.value("name",         "Object");
-        obj.mesh_path    = o.value("mesh_path",    "assets/meshes/test.obj");
-        obj.texture_path = o.value("texture_path", "assets/textures/test.tga");
-        obj.visible      = o.value("visible",      true);
-        obj.collision    = o.value("collision",    "box");
-        auto get3 = [&](const char* key, glm::vec3 def) -> glm::vec3 {
-            auto v = o.value(key, std::vector<float>{def.x,def.y,def.z});
-            return v.size()==3 ? glm::vec3{v[0],v[1],v[2]} : def;
-        };
-        obj.position = get3("position",{0,0,0});
-        obj.rotation = get3("rotation",{0,0,0});
-        obj.scale    = get3("scale",   {1,1,1});
-        objects.push_back(std::move(obj));
-    }
-    selected_index = -1;
-    status = "Loaded.";
-    fprintf(stderr, "scene: loaded %zu objects <- %s\n", objects.size(), path);
-}
+// The v2 reader/writer lives in shared/scene_format.hpp. It serialises the
+// full psx::Scene tree (kinds, parent/child links, components), so saving a
+// Player rigged with a Camera + Capsule round-trips losslessly. Loading
+// auto-migrates v1 ("objects" array) documents on the fly.
 
 // ── File picker ───────────────────────────────────────────────────────────────
 struct FilePicker {
@@ -853,6 +996,60 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
     GLint u_use_tex = glGetUniformLocation(mesh_prog,"u_use_texture");
     GLint u_tex     = glGetUniformLocation(mesh_prog,"u_texture");
 
+    // ── Project / scene paths ────────────────────────────────────────────────
+    // current_project_path: full filesystem path to the loaded project.psxproj,
+    //                       empty = free-floating mode.
+    // current_scene_path  : in project mode, relative to project root
+    //                       (e.g. "scenes/level1.pscene"); in free-floating
+    //                       mode, the path passed to save/load directly.
+    //                       Empty = unsaved.
+    std::string  current_project_path;
+    std::string  current_scene_path;
+    psx::Project current_project;
+
+    auto project_root_dir = [&]() -> std::string {
+        if (current_project_path.empty()) return "";
+        return std::filesystem::path(current_project_path)
+                   .parent_path().string();
+    };
+
+    auto assets_dir = [&](const char* sub) -> std::string {
+        if (current_project_path.empty())
+            return std::string("assets/") + sub + "/";
+        return project_root_dir() + "/assets/" + sub + "/";
+    };
+
+    // Stored asset path → real filesystem path. Built-in primitives and
+    // absolute paths pass through; in project mode, relative paths are
+    // resolved against the project root.
+    auto resolve_asset = [&](const std::string& p) -> std::string {
+        if (p.empty() || p.rfind("__primitive_", 0) == 0) return p;
+        if (current_project_path.empty()) return p;
+        namespace fs = std::filesystem;
+        fs::path pp(p);
+        if (pp.is_absolute()) return p;
+        return (fs::path(project_root_dir()) / pp).generic_string();
+    };
+
+    // Picked file path (absolute) → project-relative form for storage.
+    auto rel_to_project = [&](const std::string& abs) -> std::string {
+        if (current_project_path.empty()) return abs;
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::path rel = fs::relative(abs, project_root_dir(), ec);
+        if (ec || rel.empty()) return abs;
+        return rel.generic_string();
+    };
+
+    auto resolve_scene_path = [&](const std::string& p) -> std::string {
+        if (p.empty()) return "";
+        if (current_project_path.empty()) return p;
+        namespace fs = std::filesystem;
+        fs::path pp(p);
+        if (pp.is_absolute()) return p;
+        return (fs::path(project_root_dir()) / pp).generic_string();
+    };
+
     // ── Caches ────────────────────────────────────────────────────────────────
     std::map<std::string,MeshEntry>              mesh_cache;
     std::map<std::string,GLuint>                 tex_cache;
@@ -875,7 +1072,8 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
     auto get_mesh = [&](const std::string& path) -> MeshEntry& {
         auto it = mesh_cache.find(path);
         if (it != mesh_cache.end()) return it->second;
-        LoadedMesh lm = load_obj(path.c_str());
+        const std::string fs_path = resolve_asset(path);
+        LoadedMesh lm = load_obj(fs_path.c_str());
         // PSX geometry validation (OBJ only — primitives are pre-seeded and skip this)
         std::vector<std::string>& warns = validation_warnings[path];
         warns.clear();
@@ -896,10 +1094,24 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
         return mesh_cache[path];
     };
 
+    // Drop OBJ + TGA caches when the project root changes; primitives stay
+    // because their keys (__primitive_*__) don't depend on the project.
+    auto clear_asset_caches = [&]() {
+        for (auto it = mesh_cache.begin(); it != mesh_cache.end(); ) {
+            if (it->first.rfind("__primitive_", 0) == 0) { ++it; continue; }
+            if (it->second.vao) glDeleteVertexArrays(1, &it->second.vao);
+            if (it->second.vbo) glDeleteBuffers(1, &it->second.vbo);
+            it = mesh_cache.erase(it);
+        }
+        for (auto& [k, t] : tex_cache) if (t) glDeleteTextures(1, &t);
+        tex_cache.clear();
+        validation_warnings.clear();
+    };
+
     auto get_tex = [&](const std::string& path) -> GLuint {
         auto it = tex_cache.find(path);
         if (it != tex_cache.end()) return it->second;
-        TGAImage img = load_tga(path.c_str());
+        TGAImage img = load_tga(resolve_asset(path).c_str());
         GLuint tex = 0;
         if (!img.rgb.empty()) {
             glGenTextures(1,&tex); glBindTexture(GL_TEXTURE_2D,tex);
@@ -987,6 +1199,19 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
     std::string status_msg;
     Uint32      status_until  = 0;
     FilePicker  picker;
+
+    // Project / scene file modals — populated by File-menu handlers, drained
+    // each frame in the modal-render block below.
+    bool open_new_proj_modal_request   = false;
+    bool open_open_proj_modal_request  = false;
+    bool open_scene_picker_request     = false;
+    bool open_save_scene_as_request    = false;
+    char modal_new_proj_parent[512]    = "";
+    char modal_new_proj_name[256]      = "my_game";
+    char modal_open_proj_path[512]     = "";
+    char modal_save_scene_as[256]      = "";
+    std::vector<std::string> scene_picker_files;
+    FsBrowser fs_browser;
     int         gizmo_op      = 0;      // 0=translate 1=rotate 2=scale
     enum        { GIZMO_GLOBAL = 0, GIZMO_LOCAL = 1 };
     int         gizmo_mode    = GIZMO_GLOBAL;
@@ -998,7 +1223,6 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
     // quat on first display and held stable while the user types, so the Euler
     // triple doesn't jump as the underlying quaternion is re-decomposed.
     std::map<int, glm::vec3> preferred_euler_deg;
-    std::string current_file;           // empty = untitled
     bool        scene_dirty   = false;
     std::string last_title;
 
@@ -1037,38 +1261,179 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
     };
 
     // ── Scene actions ─────────────────────────────────────────────────────────
-    auto do_save = [&]() {
-        save_scene(scene_objects, "scene.pscene", status_msg);
-        status_until = SDL_GetTicks() + 2000;
-        if (status_msg == "Saved.") {
-            scene_dirty  = false;
-            current_file = "scene.pscene";
+    // do_save_scene_to() writes the FULL scene tree (psx::Scene) — every
+    // node kind with its parent/child links and components — using the v2
+    // serialiser from shared/scene_format.hpp. The legacy scene_objects
+    // mirror is not consulted on save.
+    auto do_save_scene_to = [&](const std::string& path) {
+        if (path.empty()) return;
+        const std::string fs_path = resolve_scene_path(path);
+        scene.format_version = 2; // belt-and-braces — to_json reads this field
+        try {
+            psx::save_scene(scene, fs_path);
+        } catch (const std::exception& e) {
+            status_msg   = std::string("Error: ") + e.what();
+            status_until = SDL_GetTicks() + 2500;
+            fprintf(stderr, "scene: save failed: %s\n", e.what());
+            return;
         }
+        fprintf(stderr, "Saved v2 scene: %d nodes -> %s\n",
+                (int)scene.nodes.size(), fs_path.c_str());
+        scene_dirty        = false;
+        current_scene_path = path;
+        status_msg         = "Saved.";
+        status_until       = SDL_GetTicks() + 2000;
     };
 
-    auto do_load = [&]() {
-        int dummy = -1;
-        load_scene(scene_objects, dummy, "scene.pscene", status_msg);
-        selected_node_id = -1;
-        sync_scene_from_objects();
+    auto do_save_scene = [&]() {
+        // Free-floating with no path → fall back to "scene.pscene" (legacy
+        // default). With a project, fall back to "scenes/untitled.pscene".
+        if (current_scene_path.empty()) {
+            current_scene_path = current_project_path.empty()
+                                     ? "scene.pscene"
+                                     : "scenes/untitled.pscene";
+        }
+        do_save_scene_to(current_scene_path);
+    };
+
+    // Loads either v2 ("nodes" / format_version==2) or v1 ("objects" array,
+    // auto-migrated). After load: scene_objects mirror is rebuilt, selection
+    // cleared, dirty flag reset, undo stacks dropped.
+    auto do_load_scene_from = [&](const std::string& path) {
+        if (path.empty()) return;
+        const std::string fs_path = resolve_scene_path(path);
+        std::ifstream f(fs_path);
+        if (!f) {
+            status_msg   = "Error: cannot open scene.";
+            status_until = SDL_GetTicks() + 2500;
+            fprintf(stderr, "scene: cannot open %s\n", fs_path.c_str());
+            return;
+        }
+        nlohmann::json doc;
+        try { doc = nlohmann::json::parse(f); }
+        catch (const std::exception& e) {
+            status_msg   = std::string("Error: ") + e.what();
+            status_until = SDL_GetTicks() + 2500;
+            fprintf(stderr, "scene: parse failed: %s\n", e.what());
+            return;
+        }
+        psx::Scene loaded;
+        const bool is_v2 =
+            doc.value("format_version", 0) == 2 || doc.contains("nodes");
+        const bool is_v1 = !is_v2 && doc.contains("objects");
+        if (is_v2) {
+            try { loaded = doc.get<psx::Scene>(); }
+            catch (const std::exception& e) {
+                status_msg   = std::string("Error: ") + e.what();
+                status_until = SDL_GetTicks() + 2500;
+                fprintf(stderr, "scene: v2 deserialise failed: %s\n", e.what());
+                return;
+            }
+            fprintf(stderr, "Loaded v2 scene: %d nodes <- %s\n",
+                    (int)loaded.nodes.size(), fs_path.c_str());
+        } else if (is_v1) {
+            loaded = psx::Scene::from_v1(doc);
+            fprintf(stderr, "Migrated v1 scene: %d nodes <- %s\n",
+                    (int)loaded.nodes.size(), fs_path.c_str());
+        } else {
+            status_msg   = "Error: unknown scene format.";
+            status_until = SDL_GetTicks() + 2500;
+            fprintf(stderr, "scene: unknown format in %s\n", fs_path.c_str());
+            return;
+        }
+
+        scene = std::move(loaded);
+        sync_objects_from_scene();
+        selected_node_id   = -1;
         preferred_euler_deg.clear();
+        scene_dirty        = false;
+        current_scene_path = path;
+        undo_stack.clear();
+        redo_stack.clear();
+        status_msg   = "Loaded.";
         status_until = SDL_GetTicks() + 2000;
-        if (status_msg == "Loaded.") {
-            scene_dirty  = false;
-            current_file = "scene.pscene";
-            undo_stack.clear();
-            redo_stack.clear();
-        }
     };
 
-    auto do_new = [&]() {
+    auto do_new_scene = [&]() {
         push_undo();
         scene_objects.clear();
         selected_node_id = -1;
         sync_scene_from_objects();
         preferred_euler_deg.clear();
-        scene_dirty    = false;
-        current_file   = "";
+        scene_dirty        = false;
+        current_scene_path = "";
+    };
+
+    // ── Project actions ───────────────────────────────────────────────────────
+    auto do_new_project = [&](const std::string& parent_dir,
+                              const std::string& proj_name) -> bool {
+        namespace fs = std::filesystem;
+        if (parent_dir.empty() || proj_name.empty()) return false;
+        fs::path root = fs::path(parent_dir) / proj_name;
+        std::error_code ec;
+        if (fs::exists(root, ec)) {
+            status_msg   = "Error: project folder already exists.";
+            status_until = SDL_GetTicks() + 2500;
+            return false;
+        }
+        if (!fs::create_directories(root / "assets" / "meshes", ec) || ec) {
+            status_msg   = "Error.";
+            status_until = SDL_GetTicks() + 2000;
+            return false;
+        }
+        fs::create_directories(root / "assets" / "textures", ec);
+        fs::create_directories(root / "scenes", ec);
+
+        psx::Project proj;
+        proj.name          = proj_name;
+        proj.default_scene = "scenes/untitled.pscene";
+        const std::string proj_path = (root / "project.psxproj").string();
+        try { psx::save_project(proj, proj_path); }
+        catch (const std::exception& e) {
+            status_msg   = std::string("Error: ") + e.what();
+            status_until = SDL_GetTicks() + 2500;
+            return false;
+        }
+
+        current_project      = proj;
+        current_project_path = proj_path;
+        clear_asset_caches();
+        do_new_scene();
+        current_scene_path = proj.default_scene;
+        do_save_scene_to(proj.default_scene);
+
+        status_msg   = "Project created.";
+        status_until = SDL_GetTicks() + 2000;
+        return true;
+    };
+
+    auto do_open_project = [&](const std::string& path) -> bool {
+        try {
+            psx::Project p = psx::load_project(path);
+            current_project      = p;
+            current_project_path = path;
+            clear_asset_caches();
+            if (!p.default_scene.empty())
+                do_load_scene_from(p.default_scene);
+            else
+                do_new_scene();
+            status_msg   = "Project opened.";
+            status_until = SDL_GetTicks() + 2000;
+            return true;
+        } catch (const std::exception& e) {
+            status_msg   = std::string("Error: ") + e.what();
+            status_until = SDL_GetTicks() + 2500;
+            return false;
+        }
+    };
+
+    auto do_close_project = [&]() {
+        current_project      = psx::Project{};
+        current_project_path = "";
+        clear_asset_caches();
+        do_new_scene();
+        status_msg   = "Project closed.";
+        status_until = SDL_GetTicks() + 2000;
     };
 
     // Add a new node under the currently-selected node (or the scene root if
@@ -1228,8 +1593,11 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
         if (key_undo)    do_undo();
         if (key_redo)    do_redo();
         if (key_dup)     do_dup();
-        if (key_save)    do_save();
-        if (key_load)    do_load();
+        if (key_save)    do_save_scene();
+        if (key_load)    do_load_scene_from(
+                             current_scene_path.empty()
+                                 ? std::string("scene.pscene")
+                                 : current_scene_path);
 
         // ── PSX render ───────────────────────────────────────────────────────
         float     aspect = (float)PSXFramebuffer::W / (float)PSXFramebuffer::H;
@@ -1244,7 +1612,7 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
         glUniform1f(u_snap, 60.f);
         for (const psx::Node& n : scene.nodes) {
             if (n.kind != "mesh") continue;
-            if (!n.visible) continue;
+            if (!node_visible(scene, n.id)) continue;
             glm::mat4 mvp = vp * world_matrix(scene, n.id);
             const auto mc = n.components.value("mesh", nlohmann::json::object());
             std::string mesh_path = mc.value("path",    std::string(""));
@@ -1264,7 +1632,7 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
         // Wireframe collision overlay for selected visible mesh node
         if (sel_idx() >= 0) {
             const SceneObject& sel = scene_objects[sel_idx()];
-            if (sel.visible && sel.collision != "none") {
+            if (node_visible(scene, selected_node_id) && sel.collision != "none") {
                 MeshEntry& me = get_mesh(sel.mesh_path);
                 glm::mat4 wire_mvp = vp * world_matrix(scene, selected_node_id);
                 glm::vec3 wcol =
@@ -1312,7 +1680,7 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
             glDisable(GL_DEPTH_TEST);
             glUseProgram(wire_prog);
             for (const psx::Node& n : scene.nodes) {
-                if (!n.visible) continue;
+                if (!node_visible(scene, n.id)) continue;
                 if (n.kind == "camera") {
                     glm::mat4 mvp = vp * world_matrix(scene, n.id);
                     draw_wire(camera_wire_verts, mvp, glm::vec3(1.f, 1.f, 1.f));
@@ -1369,9 +1737,31 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
         // ── Menu bar ──────────────────────────────────────────────────────────
         if (ImGui::BeginMainMenuBar()) {
             if (ImGui::BeginMenu("File")) {
-                if (ImGui::MenuItem("New"))             do_new();
-                if (ImGui::MenuItem("Open..","Ctrl+O")) do_load();
-                if (ImGui::MenuItem("Save","Ctrl+S"))   do_save();
+                if (ImGui::MenuItem("New Project..."))
+                    open_new_proj_modal_request = true;
+                if (ImGui::MenuItem("Open Project..."))
+                    open_open_proj_modal_request = true;
+                if (ImGui::MenuItem("Close Project", nullptr, false,
+                                    !current_project_path.empty()))
+                    do_close_project();
+                ImGui::Separator();
+                if (ImGui::MenuItem("New Scene"))             do_new_scene();
+                if (ImGui::MenuItem("Open Scene...","Ctrl+O"))
+                    open_scene_picker_request = true;
+                if (ImGui::MenuItem("Save Scene","Ctrl+S"))   do_save_scene();
+                if (ImGui::MenuItem("Save Scene As...")) {
+                    // Preseed only at menu-click time so a re-open from the
+                    // Browse... callback doesn't clobber the picked path.
+                    std::snprintf(modal_save_scene_as,
+                                  sizeof(modal_save_scene_as),
+                                  "%s",
+                                  current_scene_path.empty()
+                                      ? (current_project_path.empty()
+                                             ? "scene.pscene"
+                                             : "scenes/untitled.pscene")
+                                      : current_scene_path.c_str());
+                    open_save_scene_as_request = true;
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Quit")) running = false;
                 ImGui::EndMenu();
@@ -1399,6 +1789,10 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
             }
             ImGui::EndMainMenuBar();
         }
+
+        // Built-in file browser — renders only when open_request was set by a
+        // Browse... button. Opened at top level so it's not bound to any panel.
+        fs_browser_render(fs_browser);
 
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
 
@@ -1872,14 +2266,16 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
                 };
 
                 if (ImGui::CollapsingHeader("Mesh", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    const std::string mesh_dir = assets_dir("meshes");
+                    const std::string tex_dir  = assets_dir("textures");
                     path_field("Path",    obj.mesh_path,    "mesh", "path",
-                               "assets/meshes/",   {".obj"},                "mesh");
+                               mesh_dir.c_str(), {".obj"},                "mesh");
                     auto wit = validation_warnings.find(obj.mesh_path);
                     if (wit != validation_warnings.end())
                         for (const auto& w : wit->second)
                             ImGui::TextColored({1.f, 0.85f, 0.f, 1.f}, "! %s", w.c_str());
                     path_field("Texture", obj.texture_path, "mesh", "texture",
-                               "assets/textures/", {".tga",".png",".bmp"}, "tex");
+                               tex_dir.c_str(), {".tga",".png",".bmp"}, "tex");
                 }
                 if (ImGui::CollapsingHeader("Collision", ImGuiTreeNodeFlags_DefaultOpen)) {
                     const char* coll_items[] = {"none","box","mesh","convex"};
@@ -2048,7 +2444,9 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
             ImGui::TextDisabled("No object selected");
         }
 
-        // File picker modal
+        // File picker modal — paths picked while a project is open are
+        // converted to project-relative form so .pscene files remain portable
+        // across machines that have the project at different absolute paths.
         if (ImGui::BeginPopupModal("File Picker", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
             ImGui::Text("Select file:"); ImGui::Separator();
             if (picker.files.empty()) {
@@ -2057,7 +2455,8 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
                 for (const auto& fp : picker.files) {
                     if (ImGui::Selectable(fp.c_str())) {
                         push_undo();
-                        if (picker.dest) *picker.dest = fp;
+                        const std::string stored = rel_to_project(fp);
+                        if (picker.dest) *picker.dest = stored;
                         picker.dest  = nullptr;
                         if (psx::Node* nn = scene.find(selected_node_id);
                             nn && sel_idx() >= 0) {
@@ -2075,6 +2474,210 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
             ImGui::EndPopup();
         }
 
+        // ── New Project modal ─────────────────────────────────────────────────
+        if (open_new_proj_modal_request) {
+            ImGui::OpenPopup("New Project");
+            open_new_proj_modal_request = false;
+        }
+        if (ImGui::BeginPopupModal("New Project", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Parent directory:");
+            ImGui::SetNextItemWidth(420);
+            ImGui::InputText("##np_parent", modal_new_proj_parent,
+                             sizeof(modal_new_proj_parent));
+            ImGui::SameLine();
+            if (ImGui::Button("Browse...##np_browse")) {
+                // External tool first if user has $PSX_FILE_PICKER configured;
+                // otherwise the built-in ImGui browser. The external path is
+                // synchronous, so we update + stay in this modal in one go.
+                std::string ext = run_external_picker();
+                if (!ext.empty()) {
+                    std::snprintf(modal_new_proj_parent,
+                                  sizeof(modal_new_proj_parent),
+                                  "%s", ext.c_str());
+                } else if (!std::getenv("PSX_FILE_PICKER")) {
+                    namespace fs = std::filesystem;
+                    fs_browser.mode  = FsBrowser::OPEN_DIR;
+                    fs_browser.title = "Select parent directory for new project";
+                    fs_browser.cwd   = (modal_new_proj_parent[0] &&
+                                        fs::is_directory(modal_new_proj_parent))
+                        ? std::string(modal_new_proj_parent)
+                        : fs::current_path().string();
+                    fs_browser.filename[0] = '\0';
+                    fs_browser.exts.clear();
+                    fs_browser.on_accept = [&](const std::string& picked) {
+                        std::snprintf(modal_new_proj_parent,
+                                      sizeof(modal_new_proj_parent),
+                                      "%s", picked.c_str());
+                        open_new_proj_modal_request = true;
+                    };
+                    fs_browser.open_request = true;
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::Text("Project name:");
+            ImGui::SetNextItemWidth(420);
+            ImGui::InputText("##np_name", modal_new_proj_name,
+                             sizeof(modal_new_proj_name));
+            ImGui::Separator();
+            const bool can_create = modal_new_proj_parent[0] != '\0'
+                                 && modal_new_proj_name[0]   != '\0';
+            ImGui::BeginDisabled(!can_create);
+            if (ImGui::Button("Create", {120, 0})) {
+                if (do_new_project(modal_new_proj_parent, modal_new_proj_name))
+                    ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", {120, 0})) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        // ── Open Project modal ────────────────────────────────────────────────
+        if (open_open_proj_modal_request) {
+            ImGui::OpenPopup("Open Project");
+            open_open_proj_modal_request = false;
+        }
+        if (ImGui::BeginPopupModal("Open Project", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Path to project.psxproj:");
+            ImGui::SetNextItemWidth(420);
+            ImGui::InputText("##op_path", modal_open_proj_path,
+                             sizeof(modal_open_proj_path));
+            ImGui::Separator();
+            ImGui::BeginDisabled(modal_open_proj_path[0] == '\0');
+            if (ImGui::Button("Open", {120, 0})) {
+                if (do_open_project(modal_open_proj_path))
+                    ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", {120, 0})) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        // ── Open Scene picker ─────────────────────────────────────────────────
+        if (open_scene_picker_request) {
+            namespace fs = std::filesystem;
+            scene_picker_files.clear();
+            const std::string dir = current_project_path.empty()
+                ? std::string(".")
+                : (project_root_dir() + "/scenes");
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator(dir, ec)) {
+                if (!entry.is_regular_file()) continue;
+                std::string ext = entry.path().extension().string();
+                for (char& c : ext) c = (char)tolower((unsigned char)c);
+                if (ext == ".pscene")
+                    scene_picker_files.push_back(entry.path().string());
+            }
+            std::sort(scene_picker_files.begin(), scene_picker_files.end());
+            ImGui::OpenPopup("Open Scene");
+            open_scene_picker_request = false;
+        }
+        if (ImGui::BeginPopupModal("Open Scene", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Select scene:"); ImGui::Separator();
+            if (scene_picker_files.empty()) {
+                ImGui::TextDisabled("No .pscene files found");
+            } else {
+                for (const auto& fp : scene_picker_files) {
+                    if (ImGui::Selectable(fp.c_str())) {
+                        const std::string stored = current_project_path.empty()
+                            ? fp : rel_to_project(fp);
+                        do_load_scene_from(stored);
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::Button("Cancel", {120, 0})) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        // ── Save Scene As modal ───────────────────────────────────────────────
+        // The buffer is preseeded at menu-click time and by the Browse...
+        // callback — never reseeded here, so re-opening keeps the latest value.
+        if (open_save_scene_as_request) {
+            ImGui::OpenPopup("Save Scene As");
+            open_save_scene_as_request = false;
+        }
+        if (ImGui::BeginPopupModal("Save Scene As", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            if (current_project_path.empty())
+                ImGui::TextDisabled("Path (free-floating mode):");
+            else
+                ImGui::TextDisabled("Path (relative to project root):");
+            ImGui::SetNextItemWidth(420);
+            ImGui::InputText("##sa_path", modal_save_scene_as,
+                             sizeof(modal_save_scene_as));
+            ImGui::SameLine();
+            if (ImGui::Button("Browse...##sa_browse")) {
+                // External tool first ($PSX_FILE_PICKER); built-in fallback.
+                auto store_picked = [&](std::string picked) {
+                    if (picked.empty()) return;
+                    if (std::filesystem::path(picked).extension().empty())
+                        picked += ".pscene";
+                    std::string stored = current_project_path.empty()
+                        ? picked : rel_to_project(picked);
+                    std::snprintf(modal_save_scene_as,
+                                  sizeof(modal_save_scene_as),
+                                  "%s", stored.c_str());
+                };
+                std::string ext = run_external_picker();
+                if (!ext.empty()) {
+                    store_picked(ext);
+                } else if (!std::getenv("PSX_FILE_PICKER")) {
+                    namespace fs = std::filesystem;
+                    // Seed dir at <project>/scenes when project is open,
+                    // otherwise at the dir of the typed path or cwd.
+                    std::string seed_dir;
+                    std::string seed_name;
+                    fs::path typed(modal_save_scene_as);
+                    if (!current_project_path.empty()) {
+                        seed_dir = typed.is_absolute()
+                            ? typed.parent_path().string()
+                            : (fs::path(project_root_dir()) /
+                               (typed.has_parent_path()
+                                    ? typed.parent_path()
+                                    : fs::path("scenes"))).string();
+                    } else {
+                        seed_dir = typed.has_parent_path()
+                            ? typed.parent_path().string()
+                            : fs::current_path().string();
+                    }
+                    if (!fs::is_directory(seed_dir))
+                        seed_dir = fs::current_path().string();
+                    seed_name = typed.filename().string();
+
+                    fs_browser.mode  = FsBrowser::SAVE_FILE;
+                    fs_browser.title = "Save scene as";
+                    fs_browser.cwd   = seed_dir;
+                    std::snprintf(fs_browser.filename,
+                                  sizeof(fs_browser.filename),
+                                  "%s", seed_name.c_str());
+                    fs_browser.exts = {".pscene"};
+                    fs_browser.on_accept =
+                        [&, store_picked](const std::string& picked) {
+                            store_picked(picked);
+                            open_save_scene_as_request = true;
+                        };
+                    fs_browser.open_request = true;
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::Separator();
+            ImGui::BeginDisabled(modal_save_scene_as[0] == '\0');
+            if (ImGui::Button("Save", {120, 0})) {
+                do_save_scene_to(modal_save_scene_as);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", {120, 0})) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
         ImGui::End();
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -2085,9 +2688,15 @@ void main(){frag_color=vec4(u_wire_color,1.0);}
 
         // ── Window title ──────────────────────────────────────────────────────
         {
-            std::string title = "psx-editor \xe2\x80\x94 "
-                + (current_file.empty() ? std::string("untitled") : current_file)
-                + (scene_dirty ? " *" : "");
+            std::string scene_label = current_scene_path.empty()
+                ? std::string("untitled")
+                : std::filesystem::path(current_scene_path).filename().string();
+            std::string title = "psx-editor \xe2\x80\x94 ";
+            if (!current_project_path.empty())
+                title += current_project.name + " / " + scene_label;
+            else
+                title += scene_label;
+            title += (scene_dirty ? " *" : "");
             if (title != last_title) {
                 SDL_SetWindowTitle(win, title.c_str());
                 last_title = title;
